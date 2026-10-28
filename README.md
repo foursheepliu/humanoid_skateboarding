@@ -70,6 +70,10 @@ To install this repository, please follow these steps:
 
 This branch preserves the released task and learning algorithm. It adds a locked runtime, the missing SciPy dependency, and unique `husky-train` / `husky-play` commands because mjlab installs commands with the same `train` / `play` names. See [the bounded baseline harness](tools/README.md) for finite-value checks, exact update accounting and periodic evaluation.
 
+## SuperMimic robot–skateboard backend
+
+This branch adds a separate learned coupled-world-model and BPTT learner while preserving the original HUSKY task. It uses 8-step autoregressive fitting, 32-step imagined actor rollouts and retained adversarial pushing style. See [4090 setup, commands, tests and limits](docs/supermimic_4090.md). This is an experimental task adaptation; throughput measurements are not evidence of equal-quality convergence or sim-to-real readiness.
+
 ## Training Example
 
 ```bash
