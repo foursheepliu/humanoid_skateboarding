@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+from numbers import Real
 import statistics
 import time
 from dataclasses import asdict, dataclass, field
@@ -45,6 +46,46 @@ class BenchmarkConfig:
 
 class BudgetExceeded(Exception):
     """A wall budget expired after a complete learning update."""
+
+
+_UNSPECIFIED = object()
+
+
+def _validated_ppo_learning_rate(optimizer_state: dict, explicit=_UNSPECIFIED) -> float:
+    """Legacy checkpoints derive the adaptive rate from consistent Adam groups."""
+    groups = optimizer_state.get("param_groups") if isinstance(optimizer_state, dict) else None
+    if not isinstance(groups, (list, tuple)) or not groups:
+        raise ValueError("PPO checkpoint needs nonempty optimizer parameter groups")
+    if any(not isinstance(group, dict) for group in groups):
+        raise ValueError("PPO checkpoint optimizer parameter groups must be mappings")
+
+    def checked(value):
+        if (isinstance(value, bool) or not isinstance(value, Real)
+                or not math.isfinite(value) or value <= 0):
+            raise ValueError("PPO learning rate must be a finite positive number")
+        return float(value)
+
+    rates = [checked(group.get("lr")) for group in groups]
+    if any(rate != rates[0] for rate in rates[1:]):
+        raise ValueError("PPO checkpoint optimizer groups have inconsistent learning rates")
+    if explicit is not _UNSPECIFIED and checked(explicit) != rates[0]:
+        raise ValueError("PPO checkpoint explicit learning rate differs from optimizer groups")
+    return rates[0]
+
+
+def _validated_ppo_resume_state(payload: dict):
+    """Validate resume bookkeeping before the native loader touches parameters."""
+    amp = payload.get("benchmark_amp")
+    if not isinstance(amp, dict):
+        raise ValueError("PPO resume needs a benchmark checkpoint with AMP state")
+    learning_rate = _validated_ppo_learning_rate(
+        payload.get("optimizer_state_dict"), amp.get("learning_rate", _UNSPECIFIED))
+    iteration = payload.get("iter")
+    completed = amp.get("completed_iterations")
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+           for value in (iteration, completed)) or iteration != completed:
+        raise ValueError("PPO checkpoint iteration must equal its nonnegative completed update count")
+    return amp, learning_rate
 
 
 def _file_hash(path: Path) -> str:
@@ -245,14 +286,17 @@ def main():
                         return
                     # Original AMP/PPO saves its combined policy+D optimizer but
                     # omits D weights and normalization; complete those here.
+                    optimizer_state = self.alg.optimizer.state_dict()
+                    learning_rate = _validated_ppo_learning_rate(optimizer_state, self.alg.learning_rate)
                     payload = {"model_state_dict": self.alg.policy.state_dict(),
-                               "optimizer_state_dict": self.alg.optimizer.state_dict(),
+                               "optimizer_state_dict": optimizer_state,
                                "iter": self.current_learning_iteration, "infos": infos,
                                "benchmark_amp": {
                                    "discriminator": self.discriminator.state_dict(),
                                    "normalizer": _normalizer_state(self.amp_normalizer),
                                    "total_real_steps": self.tot_timesteps,
                                    "total_time": self.tot_time,
+                                   "learning_rate": learning_rate,
                                    "completed_iterations": self.current_learning_iteration}}
                     if hasattr(self.alg, "rnd") and self.alg.rnd:
                         payload["rnd_state_dict"] = self.alg.rnd.state_dict()
@@ -262,10 +306,13 @@ def main():
                 def load(self, path, load_optimizer=True, map_location=None):
                     payload = torch.load(path, map_location=map_location or self.device,
                                          weights_only=False)
-                    amp = payload.get("benchmark_amp")
-                    if amp is None:
-                        raise ValueError("PPO resume needs a benchmark checkpoint with AMP state")
+                    amp, learning_rate = _validated_ppo_resume_state(payload)
                     result = super().load(path, load_optimizer=load_optimizer, map_location=map_location)
+                    if load_optimizer:
+                        # Native RSL restores Adam's group rates but leaves this
+                        # Python attribute at the constructor default. Adaptive
+                        # PPO uses it to overwrite the group rates next update.
+                        self.alg.learning_rate = learning_rate
                     self.discriminator.load_state_dict(amp["discriminator"])
                     _restore_normalizer(self.amp_normalizer, amp["normalizer"])
                     self.tot_timesteps = int(amp["total_real_steps"])
