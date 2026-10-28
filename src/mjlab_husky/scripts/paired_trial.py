@@ -11,7 +11,7 @@ directory and explicit resume checkpoints; there is no restart or tuning loop.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -24,6 +24,8 @@ import subprocess
 import sys
 import time
 import traceback
+
+from mjlab_husky.supermimic.config import SuperMimicConfig
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,7 @@ class PairedTrialConfig:
     task: str = "Mjlab-Skater-Flat-Unitree-G1"
     snapshot_seconds: float = 120.0
     amp_preload: int = 4096
+    supermimic: SuperMimicConfig = field(default_factory=SuperMimicConfig)
 
 
 class TrialInterrupted(RuntimeError):
@@ -191,6 +194,18 @@ def _benchmark_command(cfg, output, initial, backend):
     resume = cfg.resume_ppo if backend == "ppo" else cfg.resume_supermimic
     if resume is not None:
         command.extend(("--resume-checkpoint", str(Path(resume).expanduser().resolve())))
+    if backend == "supermimic":
+        defaults = asdict(SuperMimicConfig())
+        for name, value in asdict(cfg.supermimic).items():
+            if value == defaults[name]:
+                continue
+            flag = name.replace("_", "-")
+            if isinstance(value, bool):
+                command.append(f"--supermimic.{'' if value else 'no-'}{flag}")
+            elif isinstance(value, (tuple, list)):
+                command.extend((f"--supermimic.{flag}", *(str(item) for item in value)))
+            else:
+                command.extend((f"--supermimic.{flag}", str(value)))
     return command
 
 
@@ -202,6 +217,12 @@ def _validate_benchmark(report, cfg, backend):
                 "amp_preload": cfg.amp_preload}
     if any(requested.get(key) != value for key, value in expected.items()):
         raise ValueError(f"{backend} benchmark configuration does not match the supervised round")
+    if backend == "supermimic" and json.dumps(
+            requested.get("supermimic"), sort_keys=True, allow_nan=False) != json.dumps(
+                asdict(cfg.supermimic), sort_keys=True, allow_nan=False):
+        # JSON represents tuples as lists; compare the full configuration while
+        # preserving bool/numeric types and detecting missing or extra fields.
+        raise ValueError("SuperMimic benchmark full configuration differs from the supervised round")
     if report.get("stop_reason") not in ("wall_budget", "iteration_cap"):
         raise ValueError(f"{backend} benchmark has no valid bounded stop reason")
     for key in ("end_to_end_seconds", "completed_iterations_this_run", "real_steps_this_run"):
