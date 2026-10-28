@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
 import math
-from typing import Mapping
+from typing import Literal, Mapping
 
 
 @dataclass
 class SuperMimicConfig:
+    actor_mode: Literal["deterministic", "reparameterized"] = "deterministic"
+    real_exploration_std: float = 0.1
     real_steps: int = 5
     horizon: int = 32
     model_sequence_length: int = 8
@@ -27,7 +29,7 @@ class SuperMimicConfig:
     critic_learning_rate: float = 2e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    entropy_coef: float = 0.005
+    entropy_coef: float = 0.005  # Active only in legacy reparameterized mode.
     max_grad_norm: float = 1.0
     min_noise_std: float = 0.05
     max_noise_std: float = 1.0
@@ -37,6 +39,10 @@ class SuperMimicConfig:
     compile_projection: bool = True
 
     def __post_init__(self):
+        if self.actor_mode not in ("deterministic", "reparameterized"):
+            raise ValueError("actor_mode must be deterministic or reparameterized")
+        if not math.isfinite(self.real_exploration_std) or self.real_exploration_std < 0:
+            raise ValueError("real_exploration_std must be finite and nonnegative")
         positive = ("real_steps", "horizon", "model_sequence_length", "model_batch_size",
                     "actor_batch_size", "replay_capacity_steps", "model_updates",
                     "actor_updates", "critic_updates", "amp_updates", "amp_batch_size",
@@ -71,6 +77,13 @@ class SuperMimicConfig:
         if "model_hidden_dims" in values:
             values["model_hidden_dims"] = tuple(values["model_hidden_dims"])
         return cls(**values)
+
+    @classmethod
+    def from_checkpoint_dict(cls, values: Mapping):
+        """Checkpoints before actor_mode used learned stochastic imagination."""
+        values = dict(values)
+        values.setdefault("actor_mode", "reparameterized")
+        return cls.from_dict(values)
 
 
 SuperMimicCfg = SuperMimicConfig

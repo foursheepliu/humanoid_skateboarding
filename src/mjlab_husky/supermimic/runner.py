@@ -89,6 +89,8 @@ class SuperMimicRunner:
         if class_name != "ActorCritic":
             raise ValueError("SuperMimicRunner requires the feed-forward HUSKY ActorCritic")
         self.policy = ActorCritic(self._obs, groups, env.num_actions, **policy_cfg).to(self.device)
+        if self.settings.actor_mode == "deterministic" and self.policy.state_dependent_std:
+            raise ValueError("Deterministic SuperMimic requires the original state-independent std checkpoint schema")
         self.alg = SimpleNamespace(policy=self.policy)  # Original inference/export tools expect this attribute.
         if amp is None:
             from .amp import AmpLearner
@@ -125,10 +127,14 @@ class SuperMimicRunner:
             self.settings.replay_capacity_steps, self.num_envs, self.adapter.state_dim,
             self.adapter.action_dim, self.device, seed=int(train_cfg.get("seed", 42)) + 1)
         self._actor_parameters = list(self.policy.actor.parameters())
-        if hasattr(self.policy, "std"):
-            self._actor_parameters.append(self.policy.std)
-        elif hasattr(self.policy, "log_std"):
-            self._actor_parameters.append(self.policy.log_std)
+        for name in ("std", "log_std"):
+            noise_parameter = getattr(self.policy, name, None)
+            if noise_parameter is not None:
+                # Keep the original checkpoint/deployment schema. Deterministic
+                # SuperMimic uses separate fixed collection noise, not this std.
+                noise_parameter.requires_grad_(self.settings.actor_mode == "reparameterized")
+                if noise_parameter.requires_grad:
+                    self._actor_parameters.append(noise_parameter)
         self.actor_optimizer = torch.optim.Adam(self._actor_parameters, lr=self.settings.actor_learning_rate)
         self.critic_optimizer = torch.optim.Adam(self.policy.critic.parameters(), lr=self.settings.critic_learning_rate)
         self._bound_std()
@@ -160,8 +166,17 @@ class SuperMimicRunner:
     def _state_obs(self, state: Tensor) -> dict[str, Tensor]:
         return {"policy": self.adapter.actor_obs(state), "critic": self.adapter.critic_obs(state)}
 
-    def _action(self, observations: Mapping, stochastic: bool = True):
+    def _action(self, observations: Mapping, stochastic: bool = True, *, imagination: bool = False):
         actor_obs = self.policy.actor_obs_normalizer(self.policy.get_actor_obs(observations))
+        if self.settings.actor_mode == "deterministic":
+            mean = self.policy.actor(actor_obs)
+            if stochastic and not imagination:
+                mean = mean + self.settings.real_exploration_std * torch.randn(
+                    mean.shape, device=self.device, generator=self._rng)
+            clip = getattr(self.env, "clip_actions", self.cfg.get("clip_actions"))
+            action = mean if clip is None else mean.clamp(-clip, clip)
+            return action, mean.new_zeros(mean.shape[:-1])
+        # Retain trial one's Gaussian path, learned std, RNG draws and entropy.
         self.policy.update_distribution(actor_obs)
         mean = self.policy.action_mean
         std = self.policy.action_std.clamp(self.settings.min_noise_std, self.settings.max_noise_std)
@@ -174,6 +189,8 @@ class SuperMimicRunner:
 
     @torch.no_grad()
     def _bound_std(self):
+        if self.settings.actor_mode == "deterministic":
+            return
         if hasattr(self.policy, "std"):
             self.policy.std.clamp_(self.settings.min_noise_std, self.settings.max_noise_std)
         elif hasattr(self.policy, "log_std"):
@@ -331,7 +348,7 @@ class SuperMimicRunner:
                 device=self.device, generator=self._rng)
         for step in range(self.settings.horizon):
             states.append(state.detach())
-            action, entropy = self._action(self._state_obs(state))
+            action, entropy = self._action(self._state_obs(state), imagination=True)
             prediction = self.world_model(state, action)
             if exogenous_projection:
                 next_state = self._project_next(
@@ -344,7 +361,8 @@ class SuperMimicRunner:
             continuation = prediction.continuation
             weight = self.settings.gamma ** step * survival
             objective = objective + weight * reward
-            entropy_total = entropy_total + weight * entropy
+            if self.settings.actor_mode == "reparameterized":
+                entropy_total = entropy_total + weight * entropy
             rewards.append(reward.detach())
             continuations.append(continuation.detach())
             weights.append(survival.detach())
@@ -353,13 +371,17 @@ class SuperMimicRunner:
         terminal = self.policy.evaluate(self._state_obs(state)).squeeze(-1)
         objective = objective + self.settings.gamma ** self.settings.horizon * survival * terminal
         states.append(state.detach())
-        actor_loss = -objective.mean() - self.settings.entropy_coef * entropy_total.mean()
+        actor_loss = -objective.mean()
+        if self.settings.actor_mode == "reparameterized":
+            actor_loss = actor_loss - self.settings.entropy_coef * entropy_total.mean()
         return actor_loss, {
             "state": torch.stack(states, 1), "reward": torch.stack(rewards, 1),
             "continuation": torch.stack(continuations, 1), "weight": torch.stack(weights, 1),
         }, {"actor/objective": float(objective.detach().mean()),
             "actor/imagined_reward": float(torch.stack(rewards, 1).mean()),
-            "actor/survival_at_horizon": float(survival.detach().mean())}
+            "actor/survival_at_horizon": float(survival.detach().mean()),
+            "actor/effective_entropy_coef": (self.settings.entropy_coef
+                                              if self.settings.actor_mode == "reparameterized" else 0.0)}
 
     def update_actor_critic(self):
         metrics: dict[str, float] = {}
@@ -436,6 +458,11 @@ class SuperMimicRunner:
             elapsed = finished - start
             self.tot_time += elapsed
             metrics.update({"iteration": self.current_learning_iteration, "total_real_steps": self.tot_timesteps,
+                            "policy/actor_mode": self.settings.actor_mode,
+                            "policy/real_exploration_std": (self.settings.real_exploration_std
+                                if self.settings.actor_mode == "deterministic"
+                                else float(self.policy.action_std.detach().mean())),
+                            "policy/imagined_stochastic_actions": self.settings.actor_mode == "reparameterized",
                             "warmup": warming, "replay_transitions": len(self.replay),
                             "time/collect": collected - start, "time/model": model_fitted - collected,
                             "time/amp": amp_fitted - model_fitted, "time/actor_critic": finished - amp_fitted,
@@ -508,7 +535,12 @@ class SuperMimicRunner:
                         "total_real_steps", "total_time", "warmup_collections", "rng"}
             if not required <= set(payload) or payload["version"] != 1:
                 raise ValueError("Unsupported or incomplete SuperMimic checkpoint schema")
-            saved_config = SuperMimicConfig.from_dict(payload["config"])
+            saved_config = SuperMimicConfig.from_checkpoint_dict(payload["config"])
+            if load_optimizer and saved_config.actor_mode != self.settings.actor_mode:
+                description = ("legacy reparameterized checkpoint (no actor_mode)"
+                               if "actor_mode" not in payload["config"] else saved_config.actor_mode)
+                raise ValueError(f"Cannot resume {description} into actor_mode={self.settings.actor_mode}. "
+                                 "Use load_optimizer=False explicitly to initialize weights without optimizer state.")
             if load_optimizer and asdict(saved_config) != asdict(self.settings):
                 raise ValueError("SuperMimic resume configuration differs from the checkpoint")
             if payload["adapter"] != self.adapter.metadata():

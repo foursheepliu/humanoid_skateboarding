@@ -6,6 +6,7 @@ expert-loader integration is covered separately by bounded GPU runs.
 
 import copy
 import json
+import math
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ except (ModuleNotFoundError, ImportError) as exc:
     raise unittest.SkipTest(f"Runner's bundled RSL-RL dependencies unavailable: {exc}") from exc
 
 from mjlab_husky.supermimic.adapter import StateLayout, roll_history, differentiable_amp_reward
+from mjlab_husky.supermimic.models import frozen_parameters
 
 
 class ToyEnvironment:
@@ -145,12 +147,92 @@ class RunnerTests(unittest.TestCase):
         return SuperMimicRunner(ToyEnvironment(), config or self.config(), log_dir,
                                 adapter=ToyAdapter(), amp=ToyAmp())
 
+    def test_actor_modes_real_noise_imagined_actions_rng_and_std_gradients(self):
+        for mode in ("deterministic", "reparameterized"):
+            for noise_type in ("scalar", "log"):
+                with self.subTest(actor_mode=mode, noise_std_type=noise_type):
+                    config = self.config(actor_mode=mode, real_exploration_std=0.1)
+                    config["policy"].update(noise_std_type=noise_type, init_noise_std=0.6)
+                    runner = self.make_runner(config)
+                    noise_parameter = getattr(runner.policy, "std" if noise_type == "scalar" else "log_std")
+                    self.assertEqual(noise_parameter.requires_grad, mode == "reparameterized")
+                    self.assertEqual(any(parameter is noise_parameter for parameter in runner._actor_parameters),
+                                     mode == "reparameterized")
+                    self.assertIn("std" if noise_type == "scalar" else "log_std", runner.policy.state_dict())
+                    mean = runner.policy.act_inference(runner._obs)
+                    generator = torch.Generator().set_state(runner._rng.get_state())
+                    expected_noise = torch.randn(mean.shape, generator=generator)
+                    real_action, _ = runner._action(runner._obs)
+                    scale = 0.1 if mode == "deterministic" else 0.6
+                    torch.testing.assert_close(real_action, mean + scale * expected_noise)
+                    self.assertTrue(torch.equal(generator.get_state(), runner._rng.get_state()))
+                    state_before = runner._rng.get_state().clone()
+                    imagined_action, entropy = runner._action(runner._obs, imagination=True)
+                    if mode == "deterministic":
+                        torch.testing.assert_close(imagined_action, mean)
+                        self.assertTrue(torch.equal(state_before, runner._rng.get_state()))
+                        self.assertTrue((entropy == 0).all())
+                    else:
+                        expected_noise = torch.randn(mean.shape, generator=generator)
+                        torch.testing.assert_close(imagined_action, mean + 0.6 * expected_noise)
+                        self.assertTrue(torch.equal(generator.get_state(), runner._rng.get_state()))
+                        expected_entropy = 2 * (math.log(0.6) + 0.5 * math.log(2 * math.pi * math.e))
+                        torch.testing.assert_close(entropy, torch.full_like(entropy, expected_entropy))
+                    imagined_action.square().mean().backward()
+                    self.assertTrue(any(parameter.grad is not None and parameter.grad.abs().sum() > 0
+                                        for parameter in runner.policy.actor.parameters()))
+                    if mode == "deterministic":
+                        self.assertIsNone(noise_parameter.grad)
+                    else:
+                        self.assertIsNotNone(noise_parameter.grad)
+                        self.assertGreater(float(noise_parameter.grad.abs().sum()), 0)
+
+    def test_h32_modes_keep_normalization_fixed_and_deterministic_mode_ignores_entropy(self):
+        for mode in ("deterministic", "reparameterized"):
+            with self.subTest(actor_mode=mode):
+                runner = self.make_runner(self.config(actor_mode=mode, entropy_coef=10.0))
+                runner.collect()
+                runner.fit_world_model()
+                norm_states = {
+                    name: copy.deepcopy(module.state_dict()) for name, module in (
+                        ("actor", runner.policy.actor_obs_normalizer),
+                        ("critic", runner.policy.critic_obs_normalizer),
+                        ("input", runner.world_model.input_norm),
+                        ("delta", runner.world_model.delta_norm),
+                        ("reward", runner.world_model.reward_norm))}
+                generator_state = runner._rng.get_state().clone()
+                runner.world_model.optimizer.zero_grad(set_to_none=True)
+                with frozen_parameters(runner.world_model, runner.amp.discriminator, runner.policy.critic):
+                    loss, trace, metrics = runner._imagine()
+                    self.assertEqual(trace["state"].shape[1], 33)
+                    if mode == "deterministic":
+                        self.assertAlmostEqual(float(loss.detach()), -metrics["actor/objective"], places=6)
+                        self.assertEqual(metrics["actor/effective_entropy_coef"], 0)
+                        self.assertTrue(torch.equal(generator_state, runner._rng.get_state()))
+                    else:
+                        self.assertLess(float(loss.detach()), -metrics["actor/objective"])
+                        self.assertEqual(metrics["actor/effective_entropy_coef"], 10)
+                        self.assertFalse(torch.equal(generator_state, runner._rng.get_state()))
+                    loss.backward()
+                self.assertTrue(any(parameter.grad is not None and parameter.grad.abs().sum() > 0
+                                    for parameter in runner.policy.actor.parameters()))
+                self.assertTrue(all(parameter.grad is None for parameter in runner.amp.discriminator.parameters()))
+                self.assertTrue(all(parameter.grad is None for parameter in runner.world_model.parameters()))
+                for name, module in (("actor", runner.policy.actor_obs_normalizer),
+                                     ("critic", runner.policy.critic_obs_normalizer),
+                                     ("input", runner.world_model.input_norm),
+                                     ("delta", runner.world_model.delta_norm),
+                                     ("reward", runner.world_model.reward_norm)):
+                    for field, value in module.state_dict().items():
+                        torch.testing.assert_close(value, norm_states[name][field], rtol=0, atol=0)
+
     def test_32_step_actor_updates_through_frozen_world_and_discriminator(self):
         runner = self.make_runner()
         metrics = runner.collect()
         self.assertEqual(metrics["validation/one_step_samples"], 18)
         runner.fit_world_model()
         before_actor = [p.detach().clone() for p in runner.policy.actor.parameters()]
+        before_std = runner.policy.std.detach().clone()
         before_world = copy.deepcopy(runner.world_model.state_dict())
         before_disc = copy.deepcopy(runner.amp.discriminator.state_dict())
         count = int(runner.policy.actor_obs_normalizer.count)
@@ -167,6 +249,8 @@ class RunnerTests(unittest.TestCase):
             torch.testing.assert_close(value, before_disc[name], rtol=0, atol=0)
         self.assertTrue(all(p.grad is None for p in runner.world_model.parameters()))
         self.assertTrue(all(p.grad is None for p in runner.amp.discriminator.parameters()))
+        torch.testing.assert_close(runner.policy.std, before_std, rtol=0, atol=0)
+        self.assertIsNone(runner.policy.std.grad)
 
     def test_lambda_returns_bootstrap_and_physical_terminal(self):
         rewards = torch.ones(2, 2, requires_grad=True)
@@ -194,6 +278,12 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(resumed.current_learning_iteration, 2)
             self.assertEqual(resumed.actor_optimizer_updates, 2)
             self.assertEqual(resumed.world_model.optimizer_updates, 2)
+            self.assertFalse(resumed.policy.std.requires_grad)
+            self.assertNotIn(resumed.policy.std, resumed.actor_optimizer.state)
+            expected_action, _ = runner._action(runner._obs)
+            resumed_action, _ = resumed._action(runner._obs)
+            torch.testing.assert_close(resumed_action, expected_action, rtol=0, atol=0)
+            self.assertTrue(torch.equal(resumed._rng.get_state(), runner._rng.get_state()))
             self.assertTrue(resumed.replay.data["truncated"][(resumed.replay.steps - 1) % resumed.replay.capacity].all())
             rows = [json.loads(line) for line in (Path(directory) / "metrics.jsonl").read_text().splitlines()]
             self.assertEqual(len(rows), 2)
@@ -218,6 +308,50 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(resumed.actor_optimizer_updates, updates)
             resumed.learn(1)
             self.assertEqual(resumed.actor_optimizer_updates, updates + 1)
+
+    def test_reparameterized_native_and_legacy_checkpoint_modes_and_rng(self):
+        config = self.config(actor_mode="reparameterized", checkpoint_replay=True)
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.make_runner(config)
+            runner.learn(2)
+            path = str(Path(directory) / "native.pt")
+            runner.save(path)
+            native = self.make_runner(config)
+            native.load(path)
+            self.assertEqual(native.actor_optimizer_updates, 2)
+            self.assertEqual(len(native.actor_optimizer.state), len(runner.actor_optimizer.state))
+            expected_action, _ = runner._action(runner._obs)
+            actual_action, _ = native._action(runner._obs)
+            torch.testing.assert_close(actual_action, expected_action, rtol=0, atol=0)
+            self.assertTrue(torch.equal(native._rng.get_state(), runner._rng.get_state()))
+            self.assertTrue(native.policy.std.requires_grad)
+            for key, parameter in native.policy.state_dict().items():
+                torch.testing.assert_close(parameter, runner.policy.state_dict()[key], rtol=0, atol=0)
+            for field in ("exp_avg", "exp_avg_sq", "step"):
+                native_state = native.actor_optimizer.state[native.policy.std][field]
+                saved_state = runner.actor_optimizer.state[runner.policy.std][field]
+                torch.testing.assert_close(native_state, saved_state, rtol=0, atol=0)
+            checkpoint = torch.load(path, weights_only=False)
+            checkpoint["supermimic"]["config"].pop("actor_mode")
+            checkpoint["supermimic"]["config"].pop("real_exploration_std")
+            legacy_path = str(Path(directory) / "legacy.pt")
+            torch.save(checkpoint, legacy_path)
+            deterministic = self.make_runner(self.config(checkpoint_replay=True))
+            initial_weights = copy.deepcopy(deterministic.policy.state_dict())
+            with self.assertRaisesRegex(ValueError, "legacy reparameterized.*actor_mode=deterministic"):
+                deterministic.load(legacy_path)
+            for key, parameter in deterministic.policy.state_dict().items():
+                torch.testing.assert_close(parameter, initial_weights[key], rtol=0, atol=0)
+            deterministic.load(legacy_path, load_optimizer=False)
+            self.assertFalse(deterministic.policy.std.requires_grad)
+            self.assertEqual(len(deterministic.actor_optimizer.state), 0)
+            for key, parameter in deterministic.policy.state_dict().items():
+                torch.testing.assert_close(parameter, checkpoint["model_state_dict"][key], rtol=0, atol=0)
+            legacy = self.make_runner(config)
+            legacy.load(legacy_path)
+            self.assertEqual(legacy.actor_optimizer_updates, 2)
+            self.assertTrue(torch.equal(legacy._rng.get_state(), checkpoint["supermimic"]["rng"]))
+            self.assertEqual(len(legacy.actor_optimizer.state), len(native.actor_optimizer.state))
 
     def test_ppo_resume_and_incompatible_schema_rejected_before_mutation(self):
         with tempfile.TemporaryDirectory() as directory:

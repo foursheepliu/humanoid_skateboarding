@@ -12,14 +12,19 @@ LAFAN policy and world-model checkpoints cannot be used for skating.
 
 ## What changes in training
 
-1. Collect real MuJoCo transitions with the original actor and exploration.
+1. Collect real MuJoCo transitions using the original actor mean plus fixed
+   Gaussian exploration with standard deviation 0.1, matching the reference
+   SuperMimic collector. The original PPO backend retains its learned noise.
 2. Fit a normalized delta world model on short replay sequences. Its reward head
    predicts the original task reward, and its termination head predicts physical
    failure. Time limits are kept separate from physical failure.
 3. Starting from real replay states, unroll a differentiable model for 32 steps.
-   Update the actor by backpropagating the imagined discounted return through
+   Use deterministic actor means during imagination. Update the actor by
+   backpropagating the imagined discounted return through
    the frozen model and frozen value/discriminator networks. Fit the critic to
-   detached lambda-return targets.
+   detached lambda-return targets. No entropy loss or learned exploration std
+   is used in this default SuperMimic mode; the original std checkpoint key is
+   retained for playback compatibility and is frozen during this training.
 4. Train the original AMP discriminator only with real histories and its
    original skating expert data. Compute the AMP reward differentiably from
    predicted joint histories; a stale combined AMP reward is not a model label.
@@ -51,6 +56,11 @@ learned model is a differentiable surrogate, not a differentiable MuJoCo solver.
 An actor can exploit model errors; imagined returns alone are not evidence that
 real skating improved. Short iteration speed does not establish time to equal
 policy quality. Compare real-simulator evaluations at fixed wall-time budgets.
+
+The earlier stochastic-actor experiment is reproducible with
+`--supermimic.actor-mode reparameterized`. Checkpoints without an `actor_mode`
+field are recognized as that legacy mode. A full optimizer resume into a
+different actor mode is rejected rather than silently mixing algorithms.
 
 ## Install and run
 
@@ -144,6 +154,20 @@ conditions and is labelled separately; do not use it as training success proof.
 Fixed-start survival, task reward and speed/heading errors must be considered
 together, with the same evaluation protocol and seed. A single short paired
 run screens the approach; it is not a multi-seed convergence result.
+
+A frozen world-model probe uses new real data, recorded actions and externally
+observed command/noise samples, without fitting or updating statistics:
+
+```bash
+uv run python scripts/check_world_model_rollout.py \
+  --checkpoint-file logs/<run>/model_<iteration>.pt --num-envs 64 --steps 32 \
+  --output logs/world_model_probe.json
+```
+
+It reports H1/H8/H32 errors and usable window counts. If no real trajectory
+survives a horizon, its physical accuracy is reported as unavailable, not zero.
+The probe's `passed` flag checks frozen state and finite predictions; it is not
+an accuracy or policy-success gate.
 
 The source task and bundled RSL-RL retain their existing licenses. Reference
 links describe algorithm provenance; the new backend does not bundle LAFAN
