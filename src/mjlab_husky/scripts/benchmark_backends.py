@@ -30,6 +30,8 @@ class BenchmarkConfig:
     backend: Literal["ppo", "supermimic"] = "ppo"
     task: str = "Mjlab-Skater-Flat-Unitree-G1"
     num_envs: int = 256
+    ppo_steps_per_env: int | None = None
+    """PPO-only rollout override. None retains the registered task default."""
     iterations: int = 12
     """Hard cap on complete updates in this invocation, including warmup."""
     wall_seconds: float | None = None
@@ -42,6 +44,33 @@ class BenchmarkConfig:
     """First case creates this shared policy/discriminator initialization."""
     resume_checkpoint: str | None = None
     supermimic: SuperMimicConfig = field(default_factory=SuperMimicConfig)
+
+    def __post_init__(self):
+        if self.ppo_steps_per_env is not None:
+            _positive_integer(self.ppo_steps_per_env, "ppo_steps_per_env")
+            if self.backend != "ppo":
+                raise ValueError("ppo_steps_per_env applies only to the PPO backend")
+
+
+def _positive_integer(value, label):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _ppo_rollout_geometry(num_envs, steps):
+    num_envs = _positive_integer(num_envs, "PPO num_envs")
+    steps = _positive_integer(steps, "PPO steps_per_env")
+    return {"version": 1, "num_envs": num_envs, "steps_per_env": steps,
+            "transitions_per_update": num_envs * steps}
+
+
+def _validate_ppo_rollout_counts(geometry, completed, total_steps):
+    if (isinstance(completed, bool) or not isinstance(completed, int) or completed < 0
+            or isinstance(total_steps, bool) or not isinstance(total_steps, int) or total_steps < 0):
+        raise ValueError("PPO rollout counts must be nonnegative integers")
+    if total_steps != completed * geometry["transitions_per_update"]:
+        raise ValueError("PPO transition count differs from completed updates * num_envs * steps_per_env")
 
 
 class BudgetExceeded(Exception):
@@ -73,7 +102,7 @@ def _validated_ppo_learning_rate(optimizer_state: dict, explicit=_UNSPECIFIED) -
     return rates[0]
 
 
-def _validated_ppo_resume_state(payload: dict):
+def _validated_ppo_resume_state(payload: dict, expected_rollout=None, *, legacy_steps_per_env=24):
     """Validate resume bookkeeping before the native loader touches parameters."""
     amp = payload.get("benchmark_amp")
     if not isinstance(amp, dict):
@@ -85,6 +114,23 @@ def _validated_ppo_resume_state(payload: dict):
     if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
            for value in (iteration, completed)) or iteration != completed:
         raise ValueError("PPO checkpoint iteration must equal its nonnegative completed update count")
+    geometry = amp.get("rollout_geometry")
+    if geometry is not None:
+        if not isinstance(geometry, dict):
+            raise ValueError("PPO rollout_geometry must be a mapping")
+        checked = _ppo_rollout_geometry(geometry.get("num_envs"), geometry.get("steps_per_env"))
+        if (type(geometry.get("version")) is not int or type(geometry.get("transitions_per_update")) is not int
+                or geometry != checked):
+            raise ValueError("PPO checkpoint rollout geometry is inconsistent")
+        if expected_rollout is not None and checked != expected_rollout:
+            raise ValueError("PPO resume rollout geometry differs; start a fresh profile instead")
+        _validate_ppo_rollout_counts(checked, completed, amp.get("total_real_steps"))
+    elif expected_rollout is not None:
+        # Historical benchmark code had no rollout override. Equal batch size
+        # does not make 1024x24 and 4096x6 compatible optimizer continuations.
+        if expected_rollout["steps_per_env"] != legacy_steps_per_env:
+            raise ValueError("Legacy PPO checkpoint has the task-default rollout; an explicit different rollout cannot resume it")
+        _validate_ppo_rollout_counts(expected_rollout, completed, amp.get("total_real_steps"))
     return amp, learning_rate
 
 
@@ -260,6 +306,9 @@ def main():
     configure_torch_backends()
     torch.manual_seed(cfg.seed)
     original = TrainConfig.from_task(cfg.task)
+    legacy_ppo_steps = _positive_integer(original.agent.num_steps_per_env, "Registered PPO rollout steps")
+    if cfg.ppo_steps_per_env is not None:
+        original.agent.num_steps_per_env = cfg.ppo_steps_per_env
     original.env.scene.num_envs = cfg.num_envs
     original.env.seed = original.agent.seed = cfg.seed
     original.agent.amp_num_preload_transitions = cfg.amp_preload
@@ -288,6 +337,8 @@ def main():
                     # omits D weights and normalization; complete those here.
                     optimizer_state = self.alg.optimizer.state_dict()
                     learning_rate = _validated_ppo_learning_rate(optimizer_state, self.alg.learning_rate)
+                    geometry = _ppo_rollout_geometry(self.env.num_envs, self.num_steps_per_env)
+                    _validate_ppo_rollout_counts(geometry, self.current_learning_iteration, self.tot_timesteps)
                     payload = {"model_state_dict": self.alg.policy.state_dict(),
                                "optimizer_state_dict": optimizer_state,
                                "iter": self.current_learning_iteration, "infos": infos,
@@ -297,6 +348,7 @@ def main():
                                    "total_real_steps": self.tot_timesteps,
                                    "total_time": self.tot_time,
                                    "learning_rate": learning_rate,
+                                   "rollout_geometry": geometry,
                                    "completed_iterations": self.current_learning_iteration}}
                     if hasattr(self.alg, "rnd") and self.alg.rnd:
                         payload["rnd_state_dict"] = self.alg.rnd.state_dict()
@@ -306,7 +358,9 @@ def main():
                 def load(self, path, load_optimizer=True, map_location=None):
                     payload = torch.load(path, map_location=map_location or self.device,
                                          weights_only=False)
-                    amp, learning_rate = _validated_ppo_resume_state(payload)
+                    amp, learning_rate = _validated_ppo_resume_state(
+                        payload, _ppo_rollout_geometry(self.env.num_envs, self.num_steps_per_env),
+                        legacy_steps_per_env=legacy_ppo_steps)
                     result = super().load(path, load_optimizer=load_optimizer, map_location=map_location)
                     if load_optimizer:
                         # Native RSL restores Adam's group rates but leaves this
@@ -387,6 +441,15 @@ def main():
         kept = clock.rows[cfg.discard_iterations:]
         seconds = [row["seconds"] for row in kept]
         result = {"benchmark": asdict(cfg), "gpu": torch.cuda.get_device_name(),
+                  "effective_steps_per_env": int(runner.num_steps_per_env),
+                  "ppo_rollout_geometry": _ppo_rollout_geometry(cfg.num_envs, runner.num_steps_per_env)
+                  if cfg.backend == "ppo" else None,
+                  "ppo_update_geometry": {
+                      "epochs": agent["algorithm"]["num_learning_epochs"],
+                      "minibatches_per_epoch": agent["algorithm"]["num_mini_batches"],
+                      "minibatch_size": cfg.num_envs * runner.num_steps_per_env // agent["algorithm"]["num_mini_batches"],
+                      "gamma": agent["algorithm"]["gamma"], "lambda": agent["algorithm"]["lam"]}
+                  if cfg.backend == "ppo" else None,
                   "scope": ("fixed wall budget on the training task; quality evaluated separately"
                             if cfg.wall_seconds is not None else
                             "short iteration throughput; quality/convergence unverified"),

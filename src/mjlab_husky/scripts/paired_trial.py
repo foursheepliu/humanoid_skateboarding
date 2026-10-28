@@ -33,6 +33,8 @@ class PairedTrialConfig:
     output_dir: str
     seconds_per_backend: float = 600.0
     num_envs: int = 256
+    ppo_steps_per_env: int | None = None
+    """PPO-only rollout override; SuperMimic keeps its own real_steps setting."""
     seed: int = 42
     hard_cap: int = 50_000
     initial_state_file: str | None = None
@@ -44,6 +46,12 @@ class PairedTrialConfig:
     snapshot_seconds: float = 120.0
     amp_preload: int = 4096
     supermimic: SuperMimicConfig = field(default_factory=SuperMimicConfig)
+
+    def __post_init__(self):
+        if self.ppo_steps_per_env is not None and (
+                isinstance(self.ppo_steps_per_env, bool) or not isinstance(self.ppo_steps_per_env, int)
+                or self.ppo_steps_per_env < 1):
+            raise ValueError("ppo_steps_per_env must be a positive integer or None")
 
 
 class TrialInterrupted(RuntimeError):
@@ -194,6 +202,8 @@ def _benchmark_command(cfg, output, initial, backend):
     resume = cfg.resume_ppo if backend == "ppo" else cfg.resume_supermimic
     if resume is not None:
         command.extend(("--resume-checkpoint", str(Path(resume).expanduser().resolve())))
+    if backend == "ppo" and cfg.ppo_steps_per_env is not None:
+        command.extend(("--ppo-steps-per-env", str(cfg.ppo_steps_per_env)))
     if backend == "supermimic":
         defaults = asdict(SuperMimicConfig())
         for name, value in asdict(cfg.supermimic).items():
@@ -223,6 +233,43 @@ def _validate_benchmark(report, cfg, backend):
         # JSON represents tuples as lists; compare the full configuration while
         # preserving bool/numeric types and detecting missing or extra fields.
         raise ValueError("SuperMimic benchmark full configuration differs from the supervised round")
+    if backend == "ppo":
+        from mjlab_husky.tasks.registry import load_rl_cfg
+        default_steps = load_rl_cfg(cfg.task).num_steps_per_env
+        expected_steps = default_steps if cfg.ppo_steps_per_env is None else cfg.ppo_steps_per_env
+        override = requested.get("ppo_steps_per_env")
+        effective = report.get("effective_steps_per_env")
+        if effective is None:
+            # Historical reports predate the override and always used the
+            # registered rollout. None must never be interpreted as requested6.
+            if override is not None:
+                raise ValueError("PPO override report is missing its effective rollout")
+            effective = default_steps
+        if (type(effective) is not int or effective < 1 or effective != expected_steps
+                or (override is not None and (type(override) is not int or override != effective))):
+            raise ValueError("PPO effective rollout differs from the supervised round")
+        if effective != (default_steps if override is None else override):
+            raise ValueError("PPO declared override/default differs from its effective rollout")
+        geometry = {"version": 1, "num_envs": cfg.num_envs, "steps_per_env": effective,
+                    "transitions_per_update": cfg.num_envs * effective}
+        actual = report.get("ppo_rollout_geometry")
+        if actual is not None and (not isinstance(actual, dict)
+                or any(type(actual.get(key)) is not int for key in geometry) or actual != geometry):
+            raise ValueError("PPO reported rollout geometry is inconsistent")
+        if report.get("effective_steps_per_env") is not None and actual is None:
+            raise ValueError("PPO effective rollout is missing its geometry receipt")
+        for iterations_key, steps_key in (("completed_iterations_this_run", "real_steps_this_run"),
+                                           ("total_iterations", "total_real_steps")):
+            if iterations_key not in report and steps_key not in report:
+                continue
+            iterations, steps = report.get(iterations_key), report.get(steps_key)
+            if (type(iterations) is not int or iterations < 0 or type(steps) is not int or steps < 0
+                    or steps != iterations * geometry["transitions_per_update"]):
+                raise ValueError("PPO reported counts differ from num_envs * effective rollout * updates")
+        for row in report.get("rows", []):
+            if (type(row.get("real_transitions")) is not int
+                    or row["real_transitions"] != geometry["transitions_per_update"]):
+                raise ValueError("PPO row transition count differs from its effective rollout")
     if report.get("stop_reason") not in ("wall_budget", "iteration_cap"):
         raise ValueError(f"{backend} benchmark has no valid bounded stop reason")
     for key in ("end_to_end_seconds", "completed_iterations_this_run", "real_steps_this_run"):

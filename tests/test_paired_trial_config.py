@@ -11,12 +11,24 @@ import tyro
 
 from mjlab_husky.scripts.benchmark_backends import BenchmarkConfig
 from mjlab_husky.scripts.paired_trial import (
-    PairedTrialConfig, _benchmark_command, _validate_benchmark,
+    PairedTrialConfig, _benchmark_command, _validate_benchmark, _reused_ppo,
 )
 from mjlab_husky.supermimic.config import SuperMimicConfig
 
 
 class PairedTrialConfigTests(unittest.TestCase):
+    def test_ppo_rollout_forward_is_backend_specific_and_typed(self):
+        cfg = PairedTrialConfig(output_dir="/tmp/output", ppo_steps_per_env=6)
+        command, parsed = self.parse(cfg, "ppo")
+        self.assertIn("--ppo-steps-per-env", command)
+        self.assertEqual(parsed.ppo_steps_per_env, 6)
+        command, parsed = self.parse(cfg, "supermimic")
+        self.assertNotIn("--ppo-steps-per-env", command)
+        self.assertIsNone(parsed.ppo_steps_per_env)
+        for value in (True, 0, -1, 6.0, "6"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                PairedTrialConfig(output_dir="/tmp/output", ppo_steps_per_env=value)
+
     def parse(self, cfg, backend="supermimic"):
         initialized = torch.cuda.is_initialized()
         command = _benchmark_command(cfg, Path("/tmp/output"), Path("/tmp/initial.pt"), backend)
@@ -100,7 +112,39 @@ class PairedTrialConfigTests(unittest.TestCase):
             # reports whose unused SM metadata predates new configuration fields.
             report["benchmark"]["backend"] = "ppo"
             report["benchmark"].pop("supermimic")
+            report["real_steps_this_run"] = cfg.num_envs * 24
             _validate_benchmark(report, cfg, "ppo")
+
+    def test_ppo_effective_rollout_and_counts_guard_reuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg, report = self.fixture(root, SuperMimicConfig())
+            report["benchmark"]["backend"] = "ppo"
+            report["real_steps_this_run"] = cfg.num_envs * 24
+            _validate_benchmark(report, cfg, "ppo")  # Historical None means registered 24.
+            requested_six = replace(cfg, ppo_steps_per_env=6)
+            with self.assertRaisesRegex(ValueError, "effective rollout"):
+                _validate_benchmark(report, requested_six, "ppo")
+            report_path = root / "legacy.json"
+            report_path.write_text(json.dumps(report))
+            initial = root / "initial.pt"
+            initial.write_bytes(b"initial")
+            with self.assertRaisesRegex(ValueError, "effective rollout"):
+                _reused_ppo(replace(requested_six, reuse_ppo_benchmark=str(report_path)), initial)
+            report["benchmark"]["ppo_steps_per_env"] = 6
+            report["effective_steps_per_env"] = 6
+            report["ppo_rollout_geometry"] = {"version": 1, "num_envs": cfg.num_envs,
+                "steps_per_env": 6, "transitions_per_update": cfg.num_envs * 6}
+            report["real_steps_this_run"] = cfg.num_envs * 6
+            _validate_benchmark(report, requested_six, "ppo")
+            for mutate in (lambda d: d.update(effective_steps_per_env=None),
+                           lambda d: d["benchmark"].update(ppo_steps_per_env=None),
+                           lambda d: d.update(real_steps_this_run=1),
+                           lambda d: d["ppo_rollout_geometry"].update(steps_per_env=24),
+                           lambda d: d.update(rows=[{"real_transitions": cfg.num_envs * 24}])):
+                invalid = json.loads(json.dumps(report)); mutate(invalid)
+                with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                    _validate_benchmark(invalid, requested_six, "ppo")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,13 @@ This branch adds an optional `--backend supermimic` to the original skating
 task. `--backend ppo` remains the default. The robot, skateboard, task rewards,
 termination rules, actor inputs and actor/critic network sizes are unchanged.
 
+The learned-model backend is experimental. Fixed-budget A5000 screens have
+not demonstrated faster learning than PPO: at about 1200 training seconds,
+PPO averaged 3.865 seconds per completed episode, versus 1.634 for the original
+uncut SuperMimic profile and 1.254 for its critic-cut variant. All had 0/64
+failure-free 20-second evaluations. These single-seed screens establish neither
+usable skating nor convergence speed; update throughput alone is insufficient.
+
 The implementation follows the learned-dynamics, short differentiable rollout
 and actor-gradient idea in [Breezewrf/supermimic_mjlab](https://github.com/Breezewrf/supermimic_mjlab)
 (reference revision `77183062eb92026bfbee2daf276f87cad36fd957`). It is a new skating
@@ -49,9 +56,12 @@ By default, `detach_critic_transition_targets=True` stops the actor's terminal
 value gradient through the independently predicted Bezier target inputs. The
 target slices are resolved from the task's observation metadata (98 coordinates
 for this task). Their forward values, critic fitting and model supervision are
-unchanged; physical-state-derived value inputs retain their gradients. This
-is a targeted model-exploitation ablation, not a claim of improved skating.
-Set `--supermimic.detach-critic-transition-targets False` to reproduce the earlier
+unchanged; other value inputs retain their gradients. Outside transitions,
+these 98 coordinates are the current poses of 14 body links relative to the
+board, so this cut also removes a legitimate geometry gradient route. Their
+independent prediction creates a possible error source, not proof of a harmful
+shortcut. This is an experimental gradient ablation, not improved-skating evidence.
+Set `--supermimic.no-detach-critic-transition-targets` to reproduce the earlier
 objective. Checkpoints without the flag are interpreted as `False`; a full
 optimizer resume across this change is rejected. Explicit weights-only loading
 can initialize a changed objective, but is not a same-algorithm continuation.
@@ -293,6 +303,24 @@ optimizer settings. CPU tests cover binding clamp/order and Adam moments; a
 bounded A5000 BF16/H32 update and native restoration passed with the reference
 settings. These checks establish integration, not faster learning or complete
 alignment with the reference training schedule.
+
+## Independent PPO rollout profiles
+
+The benchmark accepts `--ppo-steps-per-env 6 --num-envs 4096` for PPO. Omitting
+the override retains the registered task default (24 steps). The original
+1024x24 and candidate 4096x6 profiles both collect 24576 transitions per update;
+with five epochs and four minibatches, the optimizer batch sizes are unchanged.
+Fewer serial collection calls may improve throughput, but shorter GAE
+trajectories change the bootstrap bias. This is an independent PPO experiment
+and must not be reported as a SuperMimic gain.
+
+Reports and checkpoints record the actual environment count, rollout length,
+transition counts and PPO update configuration. Full optimizer resumes across
+different environment/rollout geometry are rejected even when the total batch
+size matches. Legacy checkpoints require the task-default rollout and matching
+counts. Paired trials forward this option only to PPO and reject reused reports
+whose effective rollout differs. Compare fresh profiles from a shared initial
+state and include a matched quality evaluation before claiming a speed gain.
 
 The source task and bundled RSL-RL retain their existing licenses. Reference
 links describe algorithm provenance; the new backend does not bundle LAFAN

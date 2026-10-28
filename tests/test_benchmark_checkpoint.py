@@ -70,6 +70,48 @@ class _NativeLikePPO:
 
 
 class BenchmarkCheckpointTests(unittest.TestCase):
+    def test_rollout_override_is_typed_and_ppo_only(self):
+        self.assertIsNone(benchmark.BenchmarkConfig().ppo_steps_per_env)
+        self.assertEqual(benchmark.BenchmarkConfig(ppo_steps_per_env=6).ppo_steps_per_env, 6)
+        for value in (True, False, 0, -1, 6.0, "6"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                benchmark.BenchmarkConfig(ppo_steps_per_env=value)
+        with self.assertRaises(ValueError):
+            benchmark.BenchmarkConfig(backend="supermimic", ppo_steps_per_env=6)
+
+    def test_equal_batch_size_does_not_allow_geometry_resume(self):
+        original = benchmark._ppo_rollout_geometry(1024, 24)
+        changed = benchmark._ppo_rollout_geometry(4096, 6)
+        self.assertEqual(original["transitions_per_update"], changed["transitions_per_update"])
+        payload = {"iter": 7, "optimizer_state_dict": {"param_groups": [{"lr": 1e-5}]},
+                   "benchmark_amp": {"completed_iterations": 7, "total_real_steps": 7 * 24576,
+                                     "rollout_geometry": original}}
+        benchmark._validated_ppo_resume_state(payload, original)
+        with self.assertRaisesRegex(ValueError, "geometry differs"):
+            benchmark._validated_ppo_resume_state(payload, changed)
+        payload["benchmark_amp"].pop("rollout_geometry")
+        benchmark._validated_ppo_resume_state(payload, original)
+        with self.assertRaisesRegex(ValueError, "Legacy PPO checkpoint"):
+            benchmark._validated_ppo_resume_state(payload, changed)
+
+    def test_rollout_receipt_and_count_validation(self):
+        geometry = benchmark._ppo_rollout_geometry(2, 6)
+        payload = {"iter": 7, "optimizer_state_dict": {"param_groups": [{"lr": 1e-5}]},
+                   "benchmark_amp": {"completed_iterations": 7, "total_real_steps": 84,
+                                     "rollout_geometry": dict(geometry)}}
+        benchmark._validated_ppo_resume_state(payload, geometry)
+        for key, value in (("version", True), ("num_envs", True), ("steps_per_env", 0),
+                           ("transitions_per_update", 13)):
+            invalid = json.loads(json.dumps(payload))
+            invalid["benchmark_amp"]["rollout_geometry"][key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                benchmark._validated_ppo_resume_state(invalid, geometry)
+        for value in (True, 85, 84.0):
+            invalid = json.loads(json.dumps(payload))
+            invalid["benchmark_amp"]["total_real_steps"] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                benchmark._validated_ppo_resume_state(invalid, geometry)
+
     def test_legacy_and_explicit_learning_rate(self):
         optimizer = {"param_groups": [{"lr": 1e-5}, {"lr": 1e-5}, {"lr": 1e-5}]}
         self.assertEqual(benchmark._validated_ppo_learning_rate(optimizer), 1e-5)
@@ -130,8 +172,44 @@ class BenchmarkCheckpointTests(unittest.TestCase):
             saved = torch.load(report["final_checkpoint"], map_location="cpu", weights_only=False)
             self.assertEqual(saved["iter"], 8)
             self.assertEqual(saved["benchmark_amp"]["learning_rate"], 1e-5)
+            self.assertEqual(report["effective_steps_per_env"], 24)
+            self.assertEqual(saved["benchmark_amp"]["rollout_geometry"], benchmark._ppo_rollout_geometry(2, 24))
             self.assertTrue(all(group["lr"] == 1e-5
                                 for group in saved["optimizer_state_dict"]["param_groups"]))
+
+    def test_native_six_step_resume_keeps_rate_and_geometry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _NativeLikePPO(SimpleNamespace(num_envs=2), {"num_steps_per_env": 6}, None, "cpu")
+            for group in source.alg.optimizer.param_groups:
+                group["lr"] = 1e-5
+            checkpoint = root / "six.pt"
+            torch.save({"model_state_dict": source.alg.policy.state_dict(),
+                        "optimizer_state_dict": source.alg.optimizer.state_dict(), "iter": 7, "infos": None,
+                        "benchmark_amp": {"discriminator": source.discriminator.state_dict(),
+                            "normalizer": benchmark._normalizer_state(source.amp_normalizer),
+                            "completed_iterations": 7, "total_real_steps": 84, "total_time": 3.0,
+                            "learning_rate": 1e-5, "rollout_geometry": benchmark._ppo_rollout_geometry(2, 6)}}, checkpoint)
+            cfg = benchmark.BenchmarkConfig(num_envs=2, ppo_steps_per_env=6, iterations=1, discard_iterations=0,
+                                            output=str(root / "continued"), resume_checkpoint=str(checkpoint))
+            with (patch.object(benchmark.tyro, "cli", return_value=cfg),
+                  patch("mjlab_husky.envs.G1SkaterManagerBasedRlEnv", _Environment),
+                  patch("mjlab_husky.rl.RslRlVecEnvWrapper", side_effect=lambda env, **_: env),
+                  patch("mjlab_husky.tasks.registry.load_runner_cls", return_value=_NativeLikePPO),
+                  patch("mjlab.utils.torch.configure_torch_backends"),
+                  patch.object(torch.cuda, "is_available", return_value=True),
+                  patch.object(torch.cuda, "synchronize"),
+                  patch.object(torch.cuda, "get_device_name", return_value="MOCK_CPU_ONLY"),
+                  patch.object(torch.cuda, "max_memory_allocated", return_value=0),
+                  contextlib.redirect_stdout(io.StringIO())):
+                benchmark.main()
+            report = json.loads((root / "continued/ppo/benchmark.json").read_text())
+            self.assertEqual(report["effective_steps_per_env"], 6)
+            self.assertEqual(report["total_real_steps"], 96)
+            self.assertEqual(report["rows"][0]["real_transitions"], 12)
+            saved = torch.load(report["final_checkpoint"], map_location="cpu", weights_only=False)
+            self.assertEqual(saved["benchmark_amp"]["rollout_geometry"], benchmark._ppo_rollout_geometry(2, 6))
+            self.assertEqual(saved["benchmark_amp"]["learning_rate"], 1e-5)
 
 
 if __name__ == "__main__":
