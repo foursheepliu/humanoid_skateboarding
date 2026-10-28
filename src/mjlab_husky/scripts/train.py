@@ -19,6 +19,7 @@ from mjlab.utils.os import dump_yaml, get_checkpoint_path, get_wandb_checkpoint_
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wandb import add_wandb_tags
 from mjlab.utils.wrappers import VideoRecorder
+from mjlab_husky.supermimic.config import SuperMimicConfig
 # os.environ["WANDB_MODE"] = "offline"
 
 
@@ -26,6 +27,8 @@ from mjlab.utils.wrappers import VideoRecorder
 class TrainConfig:
   env: G1SkaterManagerBasedRlEnvCfg
   agent: RslRlAMPOnPolicyRunnerCfg
+  backend: Literal["ppo", "supermimic"] = "ppo"
+  supermimic: SuperMimicConfig = field(default_factory=SuperMimicConfig)
   registry_name: str | None = None
   video: bool = False
   video_length: int = 200
@@ -119,11 +122,14 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   agent_cfg = asdict(cfg.agent)
   env_cfg = asdict(cfg.env)
 
-  runner_cls = load_runner_cls(task_id)
+  if cfg.backend == "supermimic":
+    from mjlab_husky.supermimic.runner import SuperMimicRunner
 
+    runner_cls = SuperMimicRunner
+    agent_cfg["supermimic"] = asdict(cfg.supermimic)
+  else:
+    runner_cls = load_runner_cls(task_id)
   runner_kwargs = {}
-
-
   runner = runner_cls(env, agent_cfg, str(log_dir), device, **runner_kwargs)
 
   add_wandb_tags(cfg.agent.wandb_tags)
@@ -157,6 +163,8 @@ def launch_training(task_id: str, args: TrainConfig | None = None):
 
   # Select GPUs based on CUDA_VISIBLE_DEVICES and user specification.
   selected_gpus, num_gpus = select_gpus(args.gpu_ids)
+  if args.backend == "supermimic" and num_gpus > 1:
+    raise ValueError("The SuperMimic backend currently supports one GPU per run")
 
   # Set environment variables for all modes.
   if selected_gpus is None:

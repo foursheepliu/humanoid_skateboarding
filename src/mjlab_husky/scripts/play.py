@@ -123,7 +123,9 @@ def run_play(task_id: str, cfg: PlayConfig):
   else:
     runner_cls = load_runner_cls(task_id)
     runner = runner_cls(env, asdict(agent_cfg), device=device)
-    runner.load(str(resume_path), map_location=device)
+    # Inference needs only the unchanged ActorCritic weights. The optional
+    # SuperMimic backend stores separate actor/critic/model optimizers.
+    runner.load(str(resume_path), load_optimizer=False, map_location=device)
     policy = runner.get_inference_policy(device=device)
 
   # Handle "auto" viewer selection.

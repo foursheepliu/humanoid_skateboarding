@@ -43,6 +43,12 @@ This repository contains:
 - Tested checkpoints ([`ckpts/`](ckpts/))
 
 ## Install
+
+The `suppermimic_a5000` branch includes an optional learned-world-model training
+backend. See [SuperMimic on A5000](docs/SUPERMIMIC_A5000.md) for its scope,
+commands, compatibility requirements and evaluation limits. PPO is still the
+default backend.
+
 This code has been tested on Ubuntu 22.04 with CUDA 13.0.
 To install this repository, please follow these steps:
 
