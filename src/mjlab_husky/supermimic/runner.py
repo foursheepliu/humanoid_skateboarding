@@ -108,6 +108,8 @@ class SuperMimicRunner:
         self.adapter = adapter or SkateWorldModelAdapter(env, self._obs, self.amp_obs_frames)
         if self.adapter.action_dim != env.num_actions:
             raise ValueError("Adapter/action dimensions differ")
+        self._critic_transition_target_slices = self._find_critic_transition_target_slices()
+        self.critic_transition_target_dim = sum(end - start for start, end in self._critic_transition_target_slices)
         self._project_next = self.adapter.project_next
         if self.settings.compile_projection and self.device.type == "cuda":
             # Fuse the many small history/kinematics kernels, leaving the
@@ -165,6 +167,40 @@ class SuperMimicRunner:
 
     def _state_obs(self, state: Tensor) -> dict[str, Tensor]:
         return {"policy": self.adapter.actor_obs(state), "critic": self.adapter.critic_obs(state)}
+
+    def _find_critic_transition_target_slices(self):
+        """Resolve raw critic coordinates from task metadata, never fixed offsets."""
+        wanted = {"trans_target_pos_b", "trans_target_quat_b"}
+        group = getattr(self.adapter, "critic_group", "critic")
+        terms = getattr(self.adapter, "_obs_terms", {}).get(group, ())
+        selected = [term for term in terms if term.name in wanted]
+        if selected and {term.name for term in selected} != wanted:
+            raise ValueError("Critic transition-target metadata must contain both position and quaternion terms")
+        ranges = tuple(sorted((term.start, term.stop) for term in selected))
+        previous_end = 0
+        for start, end in ranges:
+            if start < previous_end or not start < end <= self._obs["critic"].shape[-1]:
+                raise ValueError("Critic transition-target slices overlap or exceed the original observation")
+            previous_end = end
+        return ranges
+
+    def _actor_bootstrap_obs(self, state: Tensor) -> dict[str, Tensor]:
+        """Cut only learned transition targets in the actor's terminal value path.
+
+        Forward values and all other critic-input derivatives remain unchanged.
+        Critic fitting and model supervision continue using the full observations.
+        """
+        observations = self._state_obs(state)
+        if not self.settings.detach_critic_transition_targets or not self._critic_transition_target_slices:
+            return observations
+        raw = observations["critic"]
+        pieces, offset = [], 0
+        for start, end in self._critic_transition_target_slices:
+            pieces.extend((raw[..., offset:start], raw[..., start:end].detach()))
+            offset = end
+        pieces.append(raw[..., offset:])
+        observations["critic"] = torch.cat(pieces, -1)
+        return observations
 
     def _action(self, observations: Mapping, stochastic: bool = True, *, imagination: bool = False):
         actor_obs = self.policy.actor_obs_normalizer(self.policy.get_actor_obs(observations))
@@ -368,7 +404,7 @@ class SuperMimicRunner:
             weights.append(survival.detach())
             survival = survival * continuation
             state = next_state
-        terminal = self.policy.evaluate(self._state_obs(state)).squeeze(-1)
+        terminal = self.policy.evaluate(self._actor_bootstrap_obs(state)).squeeze(-1)
         objective = objective + self.settings.gamma ** self.settings.horizon * survival * terminal
         states.append(state.detach())
         actor_loss = -objective.mean()
@@ -380,6 +416,8 @@ class SuperMimicRunner:
         }, {"actor/objective": float(objective.detach().mean()),
             "actor/imagined_reward": float(torch.stack(rewards, 1).mean()),
             "actor/survival_at_horizon": float(survival.detach().mean()),
+            "actor/detached_critic_transition_target_dim": (self.critic_transition_target_dim
+                if self.settings.detach_critic_transition_targets else 0),
             "actor/effective_entropy_coef": (self.settings.entropy_coef
                                               if self.settings.actor_mode == "reparameterized" else 0.0)}
 
@@ -541,6 +579,14 @@ class SuperMimicRunner:
                                if "actor_mode" not in payload["config"] else saved_config.actor_mode)
                 raise ValueError(f"Cannot resume {description} into actor_mode={self.settings.actor_mode}. "
                                  "Use load_optimizer=False explicitly to initialize weights without optimizer state.")
+            if (load_optimizer and saved_config.detach_critic_transition_targets
+                    != self.settings.detach_critic_transition_targets):
+                description = ("legacy checkpoint without a detach_critic_transition_targets flag (interpreted as False)"
+                               if "detach_critic_transition_targets" not in payload["config"] else
+                               f"checkpoint detach_critic_transition_targets={saved_config.detach_critic_transition_targets}")
+                raise ValueError(f"Cannot resume {description} into "
+                                 f"detach_critic_transition_targets={self.settings.detach_critic_transition_targets}. "
+                                 "Use load_optimizer=False explicitly to initialize weights for the changed objective.")
             if load_optimizer and asdict(saved_config) != asdict(self.settings):
                 raise ValueError("SuperMimic resume configuration differs from the checkpoint")
             if payload["adapter"] != self.adapter.metadata():

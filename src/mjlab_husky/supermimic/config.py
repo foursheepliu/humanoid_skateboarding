@@ -11,6 +11,7 @@ from typing import Literal, Mapping
 class SuperMimicConfig:
     actor_mode: Literal["deterministic", "reparameterized"] = "deterministic"
     real_exploration_std: float = 0.1
+    detach_critic_transition_targets: bool = True
     real_steps: int = 5
     horizon: int = 32
     model_sequence_length: int = 8
@@ -41,6 +42,8 @@ class SuperMimicConfig:
     def __post_init__(self):
         if self.actor_mode not in ("deterministic", "reparameterized"):
             raise ValueError("actor_mode must be deterministic or reparameterized")
+        if not isinstance(self.detach_critic_transition_targets, bool):
+            raise ValueError("detach_critic_transition_targets must be a boolean")
         if not math.isfinite(self.real_exploration_std) or self.real_exploration_std < 0:
             raise ValueError("real_exploration_std must be finite and nonnegative")
         positive = ("real_steps", "horizon", "model_sequence_length", "model_batch_size",
@@ -83,6 +86,7 @@ class SuperMimicConfig:
         """Checkpoints before actor_mode used learned stochastic imagination."""
         values = dict(values)
         values.setdefault("actor_mode", "reparameterized")
+        values.setdefault("detach_critic_transition_targets", False)
         return cls.from_dict(values)
 
 

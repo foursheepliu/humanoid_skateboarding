@@ -87,6 +87,39 @@ class ToyAdapter:
         return self.layout.metadata()
 
 
+class RichToyEnvironment(ToyEnvironment):
+    def __init__(self, target_dims=(42, 56)):
+        super().__init__()
+        self.target_dims = target_dims
+
+    def get_observations(self):
+        target_width = sum(self.target_dims)
+        targets = self.x.repeat(1, math.ceil(target_width / 2))[:, :target_width]
+        return {"policy": self.x.clone(),
+                "critic": torch.cat((self.x, self.x.sum(-1, keepdim=True), targets), -1)}
+
+
+class RichToyAdapter(ToyAdapter):
+    """Physical critic features plus independently predicted transition targets."""
+    def __init__(self, target_dims=(42, 56)):
+        super().__init__()
+        self.critic_group = "critic"
+        self.layout = StateLayout({"actor_obs": 2, "critic_obs": 3 + sum(target_dims),
+                                   "amp_history": (2, 2), "amp_gate": ()})
+        self.state_dim = self.layout.dim
+        self._obs_terms = {"critic": (
+            SimpleNamespace(name="physical", start=0, stop=3),
+            SimpleNamespace(name="trans_target_pos_b", start=3, stop=3 + target_dims[0]),
+            SimpleNamespace(name="trans_target_quat_b", start=3 + target_dims[0], stop=3 + sum(target_dims)))}
+
+    def project_next(self, state, predicted, action):
+        fields = self.layout.unpack(super().project_next(state, predicted, action))
+        physical = fields["actor_obs"]
+        fields["critic_obs"] = torch.cat((physical, physical.sum(-1, keepdim=True),
+                                          fields["critic_obs"][..., 3:]), -1)
+        return self.layout.pack(fields)
+
+
 class ToyDiscriminator(nn.Linear):
     def __init__(self):
         super().__init__(4, 1)
@@ -146,6 +179,93 @@ class RunnerTests(unittest.TestCase):
     def make_runner(self, config=None, log_dir=None):
         return SuperMimicRunner(ToyEnvironment(), config or self.config(), log_dir,
                                 adapter=ToyAdapter(), amp=ToyAmp())
+
+    def make_rich_runner(self, config=None, target_dims=(42, 56)):
+        return SuperMimicRunner(RichToyEnvironment(target_dims), config or self.config(),
+                                adapter=RichToyAdapter(target_dims), amp=ToyAmp())
+
+    def assert_tree_identical(self, left, right):
+        if isinstance(left, torch.Tensor):
+            self.assertTrue(torch.equal(left, right))
+        elif isinstance(left, dict):
+            self.assertEqual(left.keys(), right.keys())
+            for key in left:
+                self.assert_tree_identical(left[key], right[key])
+        elif isinstance(left, (tuple, list)):
+            self.assertEqual(len(left), len(right))
+            for first, second in zip(left, right, strict=True):
+                self.assert_tree_identical(first, second)
+        else:
+            self.assertEqual(left, right)
+
+    def test_bootstrap_cut_uses_metadata_preserves_values_and_physical_gradients(self):
+        for dimensions in ((42, 56), (3, 4)):
+            with self.subTest(target_dims=dimensions):
+                runner = self.make_rich_runner(target_dims=dimensions)
+                self.assertEqual(runner.critic_transition_target_dim, sum(dimensions))
+                with torch.no_grad():
+                    for parameter in runner.policy.critic.parameters():
+                        parameter.fill_(0.01)
+                physical = torch.randn(4, 2, requires_grad=True)
+                auxiliary = torch.randn(4, sum(dimensions), requires_grad=True)
+                state = runner.adapter.layout.pack(
+                    actor_obs=physical,
+                    critic_obs=torch.cat((physical, physical.sum(-1, keepdim=True), auxiliary), -1),
+                    amp_history=torch.zeros(4, 2, 2), amp_gate=torch.ones(4))
+                full_value = runner.policy.evaluate(runner._state_obs(state))
+                cut_value = runner.policy.evaluate(runner._actor_bootstrap_obs(state))
+                self.assertTrue(torch.equal(full_value, cut_value))
+                full_physical, full_auxiliary = torch.autograd.grad(
+                    full_value.sum(), (physical, auxiliary), retain_graph=True)
+                cut_physical, cut_auxiliary = torch.autograd.grad(
+                    cut_value.sum(), (physical, auxiliary), retain_graph=True)
+                self.assertGreater(float(full_physical.norm()), 0)
+                self.assertGreater(float(full_auxiliary.norm()), 0)
+                torch.testing.assert_close(cut_physical, full_physical, rtol=0, atol=0)
+                self.assertEqual(int(torch.count_nonzero(cut_auxiliary)), 0)
+                # Ordinary evaluate, used by critic fitting/targets, still has
+                # full transition-target input gradients after the actor call.
+                normal_value = runner.policy.evaluate(runner._state_obs(state))
+                normal_auxiliary = torch.autograd.grad(normal_value.sum(), auxiliary)[0]
+                torch.testing.assert_close(normal_auxiliary, full_auxiliary, rtol=0, atol=0)
+        toy = self.make_runner()
+        self.assertEqual(toy.critic_transition_target_dim, 0)
+        sample = toy._state.clone().requires_grad_(True)
+        self.assertTrue(torch.equal(toy.policy.evaluate(toy._state_obs(sample)),
+                                    toy.policy.evaluate(toy._actor_bootstrap_obs(sample))))
+
+    def test_h32_cut_changes_only_bootstrap_gradient_not_rollout_or_model_loss(self):
+        config = self.config(checkpoint_replay=True, detach_critic_transition_targets=False)
+        baseline = self.make_rich_runner(config)
+        baseline.collect()
+        baseline.fit_world_model()
+        with torch.no_grad():
+            baseline.world_model.termination_head.bias.fill_(-2)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "baseline.pt")
+            baseline.save(path)
+            cut = self.make_rich_runner(self.config(checkpoint_replay=True))
+            cut.load(path, load_optimizer=False)
+            with frozen_parameters(baseline.world_model, baseline.amp.discriminator, baseline.policy.critic):
+                base_loss, base_trace, base_metrics = baseline._imagine()
+            with frozen_parameters(cut.world_model, cut.amp.discriminator, cut.policy.critic):
+                cut_loss, cut_trace, cut_metrics = cut._imagine()
+            self.assertTrue(torch.equal(base_loss, cut_loss))
+            for name in base_trace:
+                self.assertTrue(torch.equal(base_trace[name], cut_trace[name]), name)
+            self.assertEqual(base_metrics["actor/detached_critic_transition_target_dim"], 0)
+            self.assertEqual(cut_metrics["actor/detached_critic_transition_target_dim"], 98)
+            batch = baseline.replay.sample_sequences(8, 8)
+            base_model_loss = baseline.world_model.sequence_loss(batch)
+            cut_model_loss = cut.world_model.sequence_loss(batch)
+            for name in base_model_loss:
+                self.assertTrue(torch.equal(base_model_loss[name], cut_model_loss[name]))
+            baseline.actor_optimizer.zero_grad(set_to_none=True)
+            cut.actor_optimizer.zero_grad(set_to_none=True)
+            base_loss.backward()
+            cut_loss.backward()
+            self.assertTrue(any(not torch.equal(first.grad, second.grad) for first, second in
+                                zip(baseline.policy.actor.parameters(), cut.policy.actor.parameters(), strict=True)))
 
     def test_actor_modes_real_noise_imagined_actions_rng_and_std_gradients(self):
         for mode in ("deterministic", "reparameterized"):
@@ -310,7 +430,8 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(resumed.actor_optimizer_updates, updates + 1)
 
     def test_reparameterized_native_and_legacy_checkpoint_modes_and_rng(self):
-        config = self.config(actor_mode="reparameterized", checkpoint_replay=True)
+        config = self.config(actor_mode="reparameterized", checkpoint_replay=True,
+                             detach_critic_transition_targets=False)
         with tempfile.TemporaryDirectory() as directory:
             runner = self.make_runner(config)
             runner.learn(2)
@@ -334,6 +455,7 @@ class RunnerTests(unittest.TestCase):
             checkpoint = torch.load(path, weights_only=False)
             checkpoint["supermimic"]["config"].pop("actor_mode")
             checkpoint["supermimic"]["config"].pop("real_exploration_std")
+            checkpoint["supermimic"]["config"].pop("detach_critic_transition_targets")
             legacy_path = str(Path(directory) / "legacy.pt")
             torch.save(checkpoint, legacy_path)
             deterministic = self.make_runner(self.config(checkpoint_replay=True))
@@ -352,6 +474,51 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(legacy.actor_optimizer_updates, 2)
             self.assertTrue(torch.equal(legacy._rng.get_state(), checkpoint["supermimic"]["rng"]))
             self.assertEqual(len(legacy.actor_optimizer.state), len(native.actor_optimizer.state))
+
+    def test_missing_cut_flag_is_legacy_false_and_full_resume_rejects_changed_objective(self):
+        config = self.config(checkpoint_replay=True, detach_critic_transition_targets=False)
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.make_rich_runner(config)
+            runner.learn(1)
+            native_path = str(Path(directory) / "native-false.pt")
+            legacy_path = str(Path(directory) / "legacy-missing-flag.pt")
+            runner.save(native_path)
+            checkpoint = torch.load(native_path, weights_only=False)
+            checkpoint["supermimic"]["config"].pop("detach_critic_transition_targets")
+            torch.save(checkpoint, legacy_path)
+            native = self.make_rich_runner(config)
+            legacy = self.make_rich_runner(config)
+            native.load(native_path)
+            legacy.load(legacy_path)
+            native.learn(1)
+            legacy.learn(1)
+            for name in ("policy", "world_model"):
+                self.assert_tree_identical(getattr(native, name).state_dict(), getattr(legacy, name).state_dict())
+            for name in ("actor_optimizer", "critic_optimizer"):
+                self.assert_tree_identical(getattr(native, name).state_dict(), getattr(legacy, name).state_dict())
+            self.assert_tree_identical(native.amp.state_dict(), legacy.amp.state_dict())
+            self.assertTrue(torch.equal(native._rng.get_state(), legacy._rng.get_state()))
+            changed = self.make_rich_runner(self.config(checkpoint_replay=True))
+            before = copy.deepcopy(changed.policy.state_dict())
+            with self.assertRaisesRegex(ValueError, "legacy.*detach_critic_transition_targets.*False"):
+                changed.load(legacy_path)
+            self.assert_tree_identical(before, changed.policy.state_dict())
+            self.assertEqual(len(changed.actor_optimizer.state), 0)
+            changed.load(legacy_path, load_optimizer=False)
+            self.assert_tree_identical(changed.policy.state_dict(), checkpoint["model_state_dict"])
+            changed.learn(1)
+            cut_native_path = str(Path(directory) / "native-cut.pt")
+            changed.save(cut_native_path)
+            native_cut = self.make_rich_runner(self.config(checkpoint_replay=True))
+            native_cut.load(cut_native_path)
+            self.assertTrue(native_cut.settings.detach_critic_transition_targets)
+            self.assertEqual(native_cut.critic_transition_target_dim, 98)
+            self.assert_tree_identical(native_cut.policy.state_dict(), changed.policy.state_dict())
+            self.assert_tree_identical(native_cut.world_model.training_state_dict(),
+                                        changed.world_model.training_state_dict())
+            self.assert_tree_identical(native_cut.actor_optimizer.state_dict(), changed.actor_optimizer.state_dict())
+            self.assert_tree_identical(native_cut.critic_optimizer.state_dict(), changed.critic_optimizer.state_dict())
+            self.assertTrue(torch.equal(native_cut._rng.get_state(), changed._rng.get_state()))
 
     def test_ppo_resume_and_incompatible_schema_rejected_before_mutation(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -45,6 +45,17 @@ termination remain learned predictions. Their accuracy still needs to be
 checked in real rollouts; constraining actor observations does not eliminate
 all possible model exploitation.
 
+By default, `detach_critic_transition_targets=True` stops the actor's terminal
+value gradient through the independently predicted Bezier target inputs. The
+target slices are resolved from the task's observation metadata (98 coordinates
+for this task). Their forward values, critic fitting and model supervision are
+unchanged; physical-state-derived value inputs retain their gradients. This
+is a targeted model-exploitation ablation, not a claim of improved skating.
+Set `--supermimic.detach-critic-transition-targets False` to reproduce the earlier
+objective. Checkpoints without the flag are interpreted as `False`; a full
+optimizer resume across this change is rejected. Explicit weights-only loading
+can initialize a changed objective, but is not a same-algorithm continuation.
+
 The original environment returns an already-reset next observation on terminal
 steps. Those next states are excluded from dynamics regression and delta
 statistics, and replay sequences stop at both failure and timeout boundaries.
@@ -103,6 +114,13 @@ can load the actor without optimizer state. Training checkpoints also contain
 the model, independent optimizers, AMP statistics, replay schema and sampler
 state. A resumed process starts a fresh physical simulator episode; it does not
 restore an exact in-progress MuJoCo trajectory.
+
+The paired benchmark's PPO checkpoints also preserve the adaptive learning-rate
+attribute alongside Adam's parameter-group rates. Older benchmark checkpoints
+derive that attribute from their consistent saved group rates. Invalid or
+inconsistent rates are rejected before restoring policy weights. This avoids
+silently resetting the continued PPO run's adaptive rate to its constructor
+default. Fresh PPO updates are unchanged.
 
 ## Reproducible short timing check
 
