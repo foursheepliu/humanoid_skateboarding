@@ -24,6 +24,7 @@ class SuperMimicConfig:
     model_updates: int = 4
     actor_updates: int = 1
     critic_updates: int = 4
+    critic_loss_profile: Literal["legacy_survival_mean", "reference_time_sum"] = "legacy_survival_mean"
     amp_updates: int = 20
     amp_batch_size: int = 256
     model_hidden_dims: tuple[int, ...] = (512, 512, 512)
@@ -53,6 +54,8 @@ class SuperMimicConfig:
             raise ValueError("analytic_action_cost must be a boolean")
         if self.model_precision not in ("float32", "bfloat16"):
             raise ValueError("model_precision must be float32 or bfloat16")
+        if self.critic_loss_profile not in ("legacy_survival_mean", "reference_time_sum"):
+            raise ValueError("critic_loss_profile must be legacy_survival_mean or reference_time_sum")
         if not math.isfinite(self.real_exploration_std) or self.real_exploration_std < 0:
             raise ValueError("real_exploration_std must be finite and nonnegative")
         positive = ("real_steps", "horizon", "model_sequence_length", "model_batch_size",
@@ -99,6 +102,7 @@ class SuperMimicConfig:
         values.setdefault("project_transition_memory", False)
         values.setdefault("analytic_action_cost", False)
         values.setdefault("model_precision", "float32")
+        values.setdefault("critic_loss_profile", "legacy_survival_mean")
         return cls.from_dict(values)
 
 

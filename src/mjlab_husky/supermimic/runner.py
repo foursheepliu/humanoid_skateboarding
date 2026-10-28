@@ -45,6 +45,28 @@ def lambda_returns(rewards: Tensor, continuations: Tensor, values: Tensor,
     return result
 
 
+def critic_regression_loss(prediction: Tensor, targets: Tensor, survival_weights: Tensor,
+                           batch_size: int, profile: str) -> Tensor:
+    """Select the critic objective only; actor survival and lambda targets stay fixed.
+
+    Inputs are flattened complete imagined trajectories, with time contiguous.
+    The reference profile follows 7718306/imagination.py Eq. (3): every imagined
+    time step is valid, sum over time, then average over trajectories. It does
+    not also change Adam, clipping, minibatches, update count or the LR schedule.
+    """
+    if (prediction.ndim != 1 or prediction.shape != targets.shape
+            or prediction.shape != survival_weights.shape or batch_size < 1
+            or not prediction.numel() or prediction.numel() % batch_size):
+        raise ValueError("Critic loss requires flattened complete imagined trajectories")
+    if profile == "legacy_survival_mean":
+        # Keep the original flat operation/reduction order for legacy replay.
+        return (survival_weights * (prediction - targets).square()).sum() / survival_weights.sum().clamp_min(1)
+    if profile == "reference_time_sum":
+        error = (prediction - targets).reshape(batch_size, -1)
+        return error.double().square().sum(dim=1).mean().to(prediction.dtype)
+    raise ValueError("Unknown critic loss profile")
+
+
 class SuperMimicRunner:
     """RSL-style runner with independent model, actor, critic and AMP optimizers.
 
@@ -474,7 +496,8 @@ class SuperMimicRunner:
         for _ in range(self.settings.critic_updates):
             self.critic_optimizer.zero_grad(set_to_none=True)
             prediction = self.policy.evaluate(self._state_obs(inputs)).squeeze(-1)
-            loss = (weights * (prediction - targets).square()).sum() / weights.sum().clamp_min(1)
+            loss = critic_regression_loss(prediction, targets, weights, batch,
+                                          self.settings.critic_loss_profile)
             self._finite("critic loss", loss)
             loss.backward()
             norm = clip_grad_norm_(self.policy.critic.parameters(), self.settings.max_grad_norm,
@@ -608,6 +631,9 @@ class SuperMimicRunner:
                 raise ValueError("Cannot resume world-model optimizer across model_precision modes. "
                                  "Use load_optimizer=False explicitly to initialize FP32 master weights "
                                  "without importing optimizer state.")
+            if load_optimizer and saved_config.critic_loss_profile != self.settings.critic_loss_profile:
+                raise ValueError("Cannot resume optimizer state across critic_loss_profile objectives. "
+                                 "Use load_optimizer=False explicitly to initialize weights for the new objective.")
             if load_optimizer and saved_config.actor_mode != self.settings.actor_mode:
                 description = ("legacy reparameterized checkpoint (no actor_mode)"
                                if "actor_mode" not in payload["config"] else saved_config.actor_mode)

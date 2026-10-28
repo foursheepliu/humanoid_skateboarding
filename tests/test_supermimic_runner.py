@@ -16,7 +16,7 @@ import torch
 from torch import nn
 
 try:
-    from mjlab_husky.supermimic.runner import SuperMimicRunner, lambda_returns
+    from mjlab_husky.supermimic.runner import SuperMimicRunner, lambda_returns, critic_regression_loss
 except (ModuleNotFoundError, ImportError) as exc:
     raise unittest.SkipTest(f"Runner's bundled RSL-RL dependencies unavailable: {exc}") from exc
 
@@ -849,6 +849,89 @@ class RunnerTests(unittest.TestCase):
             self.assert_tree_identical(before, native.policy.state_dict())
         with self.assertRaisesRegex(ValueError, "model_precision must"):
             self.make_runner(self.config(model_precision="float16"))
+
+
+    def test_critic_loss_profiles_preserve_legacy_and_reference_time_sum_gradients(self):
+        prediction = torch.arange(1., 7., requires_grad=True)
+        targets = torch.zeros_like(prediction)
+        weights = torch.tensor([1., .5, .01, 1., .1, 0.])
+        legacy = critic_regression_loss(prediction, targets, weights, 2, "legacy_survival_mean")
+        original = (weights * (prediction - targets).square()).sum() / weights.sum().clamp_min(1)
+        self.assertTrue(torch.equal(legacy, original))
+        legacy_gradient = torch.autograd.grad(legacy, prediction, retain_graph=True)[0]
+        original_gradient = torch.autograd.grad(original, prediction, retain_graph=True)[0]
+        self.assertTrue(torch.equal(legacy_gradient, original_gradient))
+        reference = critic_regression_loss(prediction, targets, weights, 2, "reference_time_sum")
+        self.assertEqual(float(reference.detach()), 45.5)
+        reference_gradient = torch.autograd.grad(reference, prediction)[0]
+        torch.testing.assert_close(reference_gradient, prediction.detach(), rtol=0, atol=0)
+        changed_weights = critic_regression_loss(prediction, targets, torch.zeros_like(weights), 2,
+                                                 "reference_time_sum")
+        self.assertTrue(torch.equal(reference, changed_weights))
+        # Time duplication doubles Eq. (3); batch duplication leaves it equal.
+        for axis, expected_factor in ((1, 2), (0, 1)):
+            values = torch.cat((prediction.reshape(2, 3), prediction.reshape(2, 3)), axis)
+            loss = critic_regression_loss(values.flatten(), torch.zeros_like(values).flatten(),
+                                          torch.ones_like(values).flatten(), values.shape[0], "reference_time_sum")
+            self.assertEqual(float(loss.detach()), 45.5 * expected_factor)
+        # FP64 intermediate reduction is relevant even with FP32 master values.
+        large = torch.full((4,), 1e19, requires_grad=True)
+        finite = critic_regression_loss(large, torch.zeros_like(large), torch.ones_like(large), 4,
+                                        "reference_time_sum")
+        self.assertTrue(torch.isfinite(finite))
+        finite.backward()
+        self.assertTrue(torch.isfinite(large.grad).all())
+
+    def test_reference_critic_profile_keeps_actor_objective_and_guards_training_resume(self):
+        legacy_config = self.config(checkpoint_replay=True)
+        ref_config = self.config(checkpoint_replay=True, critic_loss_profile="reference_time_sum")
+        with tempfile.TemporaryDirectory() as directory:
+            legacy = self.make_runner(legacy_config)
+            legacy.collect(); legacy.fit_world_model()
+            path = str(Path(directory) / "legacy.pt")
+            legacy.save(path)
+            reference = self.make_runner(ref_config)
+            before = copy.deepcopy((reference.policy.state_dict(), reference.world_model.training_state_dict(),
+                                     reference.actor_optimizer.state_dict(), reference.amp.state_dict(),
+                                     reference._rng.get_state(), reference.replay.state_dict()))
+            with self.assertRaisesRegex(ValueError, "across critic_loss_profile objectives"):
+                reference.load(path)
+            self.assert_tree_identical(before, (reference.policy.state_dict(), reference.world_model.training_state_dict(),
+                                                reference.actor_optimizer.state_dict(), reference.amp.state_dict(),
+                                                reference._rng.get_state(), reference.replay.state_dict()))
+            reference.load(path, load_optimizer=False)
+            for runner in (legacy, reference):
+                with frozen_parameters(runner.world_model, runner.amp.discriminator, runner.policy.critic):
+                    loss, trace, metrics = runner._imagine()
+                if runner is legacy:
+                    expected = loss.detach(), trace, metrics
+                else:
+                    self.assert_tree_identical(expected, (loss.detach(), trace, metrics))
+            legacy_metrics = legacy.update_actor_critic()
+            ref_metrics = reference.update_actor_critic()
+            self.assert_tree_identical(legacy.policy.actor.state_dict(), reference.policy.actor.state_dict())
+            self.assertNotEqual(legacy_metrics["critic/loss"], ref_metrics["critic/loss"])
+            self.assertTrue(all(math.isfinite(value) for value in ref_metrics.values()))
+            self.assertEqual(reference.actor_optimizer.param_groups[0]["betas"], (.9, .999))
+            native_path = str(Path(directory) / "reference.pt")
+            reference.save(native_path)
+            native = self.make_runner(ref_config)
+            native.load(native_path)
+            self.assert_tree_identical(native.policy.state_dict(), reference.policy.state_dict())
+            self.assert_tree_identical(native.critic_optimizer.state_dict(), reference.critic_optimizer.state_dict())
+            self.assert_tree_identical(native.world_model.training_state_dict(), reference.world_model.training_state_dict())
+            self.assertTrue(torch.equal(native._rng.get_state(), reference._rng.get_state()))
+            old = torch.load(path, weights_only=False)
+            old["supermimic"]["config"].pop("critic_loss_profile")
+            old_path = str(Path(directory) / "old-missing-profile.pt")
+            torch.save(old, old_path)
+            restored_legacy = self.make_runner(legacy_config)
+            restored_legacy.load(old_path)
+            self.assertEqual(restored_legacy.settings.critic_loss_profile, "legacy_survival_mean")
+            with self.assertRaisesRegex(ValueError, "across critic_loss_profile objectives"):
+                native.load(old_path)
+        with self.assertRaisesRegex(ValueError, "critic_loss_profile must"):
+            self.make_runner(self.config(critic_loss_profile="not_a_profile"))
 
 
 if __name__ == "__main__":

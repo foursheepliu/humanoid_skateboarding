@@ -260,6 +260,23 @@ same FP32 master-parameter format. A world model cannot be loaded across
 transition-memory projection modes, including weights-only loading. Use fresh
 runs when comparing these profiles and include compilation/startup in the budget.
 
+## Critic objective alignment
+
+`--supermimic.critic-loss-profile reference_time_sum` matches the reference's
+critic regression objective: sum squared errors over all imagined time steps,
+then average over trajectories. Squaring and reduction use FP64 intermediates;
+the final scalar returns to the prediction dtype. The default
+`legacy_survival_mean` retains the earlier survival-weighted mean exactly.
+Loss magnitudes across the two profiles are not directly comparable.
+
+This switch changes the critic objective only. Actor survival gradients,
+lambda-return targets, reward/termination, Adam parameters, clipping, update
+counts and learning-rate scheduling are unchanged. In particular, it does not
+claim complete alignment with all reference optimizer/scheduling choices.
+Checkpoints without the setting use the legacy objective. Full optimizer resume
+across objectives is rejected before state mutation; explicit weights-only
+initialization is allowed. Use fresh equal-budget runs for the comparison.
+
 The source task and bundled RSL-RL retain their existing licenses. Reference
 links describe algorithm provenance; the new backend does not bundle LAFAN
 assets or pretrained checkpoints from the reference project.
