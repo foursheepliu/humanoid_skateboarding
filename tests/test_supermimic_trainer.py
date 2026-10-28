@@ -136,6 +136,24 @@ def learning_step(trainer):
     return torch.stack((loss.detach(), style_loss.detach(), imagined["actor_loss"].detach(), value_loss.detach()))
 
 
+def attach_frozen_teacher(trainer):
+    trainer.warm_started = True
+    trainer.reference_actor = copy.deepcopy(trainer.policy.actor).eval().requires_grad_(False)
+    trainer.reference_normalizer = copy.deepcopy(trainer.policy.actor_obs_normalizer).eval().requires_grad_(False)
+    trainer.reference_std = trainer.policy.std.detach().abs().clamp_min(0.05).clone()
+    trainer.trust_inputs = None
+    trainer.adapter = SimpleNamespace(state_to_observations=observations)
+
+
+def adversarial_imagination(trainer, starts):
+    """Intentionally reward unbounded predicted board movement to probe guards."""
+    return imagine(
+        trainer.policy, trainer.world, starts, observations, horizon=4,
+        context=torch.tensor([[0.4, -0.3]]).expand(len(starts), -1),
+        reward_callback=lambda state, action, nxt, reward, step: 100 * nxt[:, -2:].sum(-1),
+    )
+
+
 def snapshot(trainer):
     return copy.deepcopy({
         "policy": trainer.policy.state_dict(), "world": trainer.world.state_dict(),
@@ -250,6 +268,114 @@ class SuperMimicTrainerCheckpointTest(unittest.TestCase):
             torch.save({"model_state_dict": trainer.policy.state_dict(), "iter": 10000}, path)
             with self.assertRaisesRegex(ValueError, "policy warm start"):
                 trainer.load(path)
+
+    def test_nonzero_bptt_steps_are_accepted_within_cumulative_frozen_teacher_bounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = make_trainer(directory)
+            learning_step(trainer)
+            attach_frozen_teacher(trainer)
+            teacher = copy.deepcopy(trainer.reference_actor.state_dict())
+            normalizer = copy.deepcopy(trainer.reference_normalizer.state_dict())
+            starts = trainer.replay.sample(4, 1).states[:, 0]
+            initial = [p.detach().clone() for p in trainer.policy.actor.parameters()]
+            for _ in range(3):
+                imagined = adversarial_imagination(trainer, starts)
+                gradients = torch.autograd.grad(
+                    imagined["actor_loss"], tuple(trainer.policy.actor.parameters()), retain_graph=True,
+                )
+                self.assertGreater(sum(float(g.abs().sum()) for g in gradients), 1e-9)
+                result = trainer.actor_step(imagined, starts)
+                self.assertEqual(float(result["actor_step_accepted"]), 1)
+                self.assertGreater(float(result["actor_step_scale"]), 0)
+                self.assertLessEqual(float(result["actor_teacher_kl"]), trainer.cfg.teacher_kl_limit)
+                self.assertLessEqual(float(result["actor_max_action_delta"]), trainer.cfg.teacher_max_action_delta)
+                self.assertLessEqual(float(result["actor_max_standardized_delta"]), trainer.cfg.teacher_max_standardized_delta)
+            self.assertTrue(any(not torch.equal(p.detach(), old) for p, old in zip(trainer.policy.actor.parameters(), initial)))
+            self.assert_nested_equal(teacher, trainer.reference_actor.state_dict())
+            self.assert_nested_equal(normalizer, trainer.reference_normalizer.state_dict())
+            self.assertTrue(all(not p.requires_grad and p.grad is None for p in trainer.reference_actor.parameters()))
+            self.assertIsNotNone(trainer.trust_inputs)
+
+    def test_backtracking_projects_parameters_and_retains_proposal_adam_moments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = make_trainer(directory)
+            learning_step(trainer)
+            attach_frozen_teacher(trainer)
+            for group in trainer.actor_optimizer.param_groups:
+                group["lr"] = 1.0  # Force a proposal outside the teacher radius.
+            starts = trainer.replay.sample(4, 1).states[:, 0]
+            proposal = copy.deepcopy(trainer)
+            proposal.cfg = replace(proposal.cfg, teacher_kl_limit=float("inf"),
+                                   teacher_max_action_delta=float("inf"),
+                                   teacher_max_standardized_delta=float("inf"))
+            before = [p.detach().clone() for p in trainer.policy.actor.parameters()]
+            raw_result = proposal.actor_step(adversarial_imagination(proposal, starts), starts)
+            guarded = trainer.actor_step(adversarial_imagination(trainer, starts), starts)
+            self.assertEqual(float(raw_result["actor_step_scale"]), 1)
+            self.assertEqual(float(guarded["actor_step_accepted"]), 1)
+            scale = float(guarded["actor_step_scale"])
+            self.assertGreater(scale, 0)
+            self.assertLess(scale, 1)
+            for old, raw, actual in zip(before, proposal.policy.actor.parameters(), trainer.policy.actor.parameters()):
+                torch.testing.assert_close(actual, old + scale * (raw.detach() - old), rtol=0, atol=0)
+            # This is projected Adam: accepted proposals keep Adam's full moment
+            # update, even when parameter displacement is backtracked.
+            self.assert_nested_equal(proposal.actor_optimizer.state_dict(), trainer.actor_optimizer.state_dict())
+            self.assertLessEqual(float(guarded["actor_teacher_kl"]), trainer.cfg.teacher_kl_limit)
+            self.assertLessEqual(float(guarded["actor_max_action_delta"]), trainer.cfg.teacher_max_action_delta)
+            self.assertLessEqual(float(guarded["actor_max_standardized_delta"]), trainer.cfg.teacher_max_standardized_delta)
+
+    def test_rejected_step_restores_parameters_and_nonempty_adam_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = make_trainer(directory)
+            learning_step(trainer)
+            attach_frozen_teacher(trainer)
+            trainer.cfg = replace(trainer.cfg, teacher_kl_limit=0.0,
+                                  teacher_max_action_delta=0.0, teacher_max_standardized_delta=0.0)
+            for group in trainer.actor_optimizer.param_groups:
+                group["lr"] = 0.1
+            starts = trainer.replay.sample(4, 1).states[:, 0]
+            parameters = copy.deepcopy(trainer.policy.actor.state_dict())
+            optimizer = copy.deepcopy(trainer.actor_optimizer.state_dict())
+            self.assertTrue(optimizer["state"])
+            result = trainer.actor_step(adversarial_imagination(trainer, starts), starts)
+            self.assertEqual(float(result["actor_step_accepted"]), 0)
+            self.assertEqual(float(result["actor_step_scale"]), 0)
+            self.assert_nested_equal(parameters, trainer.policy.actor.state_dict())
+            self.assert_nested_equal(optimizer, trainer.actor_optimizer.state_dict())
+            self.assertEqual(float(result["actor_teacher_kl"]), 0)
+
+    def test_teacher_anchor_and_independent_validation_rng_roundtrip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = make_trainer(directory)
+            learning_step(trainer)
+            attach_frozen_teacher(trainer)
+            trainer.reference_std.fill_(0.37)
+            starts = trainer.replay.sample(4, 1).states[:, 0]
+            trainer.actor_step(adversarial_imagination(trainer, starts), starts)
+            trainer.validation_generator = torch.Generator(device="cpu").manual_seed(104771)
+            global_rng = torch.get_rng_state().clone()
+            trainer.validation_batch = trainer.sample(4, 3, None, generator=trainer.validation_generator)
+            torch.testing.assert_close(global_rng, torch.get_rng_state(), rtol=0, atol=0)
+            path = Path(directory) / "anchored.pt"
+            trainer.save(path)
+            expected_generator = trainer.validation_generator.get_state().clone()
+            expected_sample = trainer.sample(5, 3, None, generator=trainer.validation_generator)
+
+            restored = make_trainer(directory, initialization_seed=103, warm_started=False)
+            restored.load(path)
+            self.assertTrue(restored.warm_started)
+            self.assert_nested_equal(trainer.reference_actor.state_dict(), restored.reference_actor.state_dict())
+            self.assert_nested_equal(trainer.reference_normalizer.state_dict(), restored.reference_normalizer.state_dict())
+            torch.testing.assert_close(trainer.reference_std, restored.reference_std, rtol=0, atol=0)
+            torch.testing.assert_close(trainer.trust_inputs, restored.trust_inputs, rtol=0, atol=0)
+            self.assert_nested_equal(trainer.validation_batch, restored.validation_batch)
+            torch.testing.assert_close(expected_generator, restored.validation_generator.get_state(), rtol=0, atol=0)
+            global_rng = torch.get_rng_state().clone()
+            actual_sample = restored.sample(5, 3, None, generator=restored.validation_generator)
+            self.assert_nested_equal(expected_sample, actual_sample)
+            torch.testing.assert_close(global_rng, torch.get_rng_state(), rtol=0, atol=0)
+            self.assertTrue(all(not p.requires_grad for p in restored.reference_actor.parameters()))
 
 
 if __name__ == "__main__":

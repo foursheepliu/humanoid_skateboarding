@@ -1,0 +1,189 @@
+{
+  "date": "2026-10-29",
+  "gpu": "NVIDIA GeForce RTX 4090 D 23028MiB",
+  "cpu_replay": true,
+  "host_replay_bytes": 18447171088,
+  "iterations": 50,
+  "stable_window": [
+    21,
+    50
+  ],
+  "baseline": {
+    "algorithm": "original HUSKY PPO+AMP",
+    "mean_seconds": 1.92694,
+    "source_updates": [
+      7530,
+      8529
+    ],
+    "real_sim_transitions_per_update": 98304,
+    "epochs": 5,
+    "minibatches": 4
+  },
+  "backend": {
+    "algorithm": "coupled world model + BPTT + adversarial style + warm-start teacher trust",
+    "actor_optimizer_steps_accepted": 50,
+    "anchor_projections": 4.0,
+    "max_teacher_kl": 0.0029999609105288982,
+    "max_raw_action_delta": 0.02994358539581299,
+    "max_standardized_action_delta": 0.09921563416719437,
+    "imagined_actor_transitions_per_iteration": 8192,
+    "model_fitting_transitions_per_iteration": 20480,
+    "real_sim_transitions_per_iteration_steady_average": 10240,
+    "warmup_real_steps": 1310720,
+    "real_steps_total": 1822720,
+    "peak_torch_allocated_bytes": 622908928,
+    "model_hidden": [
+      512,
+      512,
+      512
+    ],
+    "world_horizon": 8,
+    "actor_horizon": 32,
+    "expert_preload": 20000,
+    "means_seconds": {
+      "collect_seconds": 0.13882033434541274,
+      "model_seconds": 0.36619816921496146,
+      "imagination_seconds": 0.1141674648427094,
+      "validation_seconds": 0.0009185239129389325,
+      "total_seconds": 0.6201044923160225
+    },
+    "heldout_first": {
+      "heldout_loss": 6.611734390258789,
+      "heldout_state": 6.070798873901367,
+      "heldout_reward": 0.5376810431480408,
+      "heldout_termination": 0.0032545472495257854,
+      "heldout_state_transitions": 2048.0,
+      "heldout_labeled_transitions": 2048.0
+    },
+    "heldout_last": {
+      "heldout_loss": 0.8954068422317505,
+      "heldout_state": 0.8193321228027344,
+      "heldout_reward": 0.07603021711111069,
+      "heldout_termination": 4.452001303434372e-05,
+      "heldout_state_transitions": 2048.0,
+      "heldout_labeled_transitions": 2048.0
+    }
+  },
+  "scope": "Different algorithms/sample workloads; latency ratio is not equal-success convergence acceleration. Warm start from baseline10K, not a scratch training result.",
+  "iteration_latency_ratio": 3.1074440257690923,
+  "teacher10000": {
+    "sha256": "528560e39ab45fe25c08fa4bac37c5795fe2fdd0054fb644f208e1e33d77275d",
+    "checkpoint_iteration": 9999,
+    "steps": 1500,
+    "dt": 0.02,
+    "ppo_updates": 0,
+    "conditions": "author play config, seed42, speed0.8m/s, relative heading0.5rad",
+    "phase_frame_counts": [
+      602.0,
+      678.0,
+      148.0,
+      72.0
+    ],
+    "resets": 0,
+    "minimum_root_height_m": 0.6605786085128784,
+    "fell_over_frames_above_70deg": 0,
+    "raw_board_contact_threshold_newtons": 5.0,
+    "steering_both_feet_board_fraction": 1.0,
+    "pushing_velocity_mae_mps": 0.13504455547990196,
+    "steering_heading_mae_rad": 0.2937900269710803,
+    "board_displacement_m": 26.132078170776367,
+    "limits": "One fixed-condition play rollout; play mode disables fall terminations. Not a success rate.",
+    "camera_azimuths_relative_torso": [
+      210,
+      120
+    ],
+    "video_sha256": "3480ae63bd6b968404963eefa99be3b8ecf3dbf5a396d88817dde267b77966e7"
+  },
+  "projected256_diag50": {
+    "sha256": "54ab6deda873a6d844716fd27bdabdd6b9c2a0eed0d7d7585a0327ff4535a27e",
+    "checkpoint_iteration": null,
+    "steps": 1500,
+    "dt": 0.02,
+    "ppo_updates": 0,
+    "conditions": "author play config, seed42, speed0.8m/s, relative heading0.5rad",
+    "phase_frame_counts": [
+      602.0,
+      678.0,
+      148.0,
+      72.0
+    ],
+    "resets": 0,
+    "minimum_root_height_m": 0.6614996790885925,
+    "fell_over_frames_above_70deg": 0,
+    "raw_board_contact_threshold_newtons": 5.0,
+    "steering_both_feet_board_fraction": 1.0,
+    "pushing_velocity_mae_mps": 0.12247224468923486,
+    "steering_heading_mae_rad": 0.27287047781081286,
+    "board_displacement_m": 24.287551879882812,
+    "limits": "One fixed-condition play rollout; play mode disables fall terminations. Not a success rate.",
+    "camera_azimuths_relative_torso": [
+      210,
+      120
+    ],
+    "video_sha256": "1851ca8c8aeefd068249ab6a114bed71aad4adffade80e5f24b57521b1f736fb"
+  },
+  "supermimic256_diag50": {
+    "sha256": "14c26785d31063a16f7a910e56dd2ff27ff490ca848c3f2db01eb0023f04713c",
+    "checkpoint_iteration": null,
+    "steps": 1500,
+    "dt": 0.02,
+    "ppo_updates": 0,
+    "conditions": "author play config, seed42, speed0.8m/s, relative heading0.5rad",
+    "phase_frame_counts": [
+      602.0,
+      678.0,
+      148.0,
+      72.0
+    ],
+    "resets": 0,
+    "minimum_root_height_m": 0.11573846638202667,
+    "board_displacement_m": 15.48441219329834,
+    "limits": "One fixed-condition play rollout; play mode disables fall terminations. Not a success rate.",
+    "camera_azimuths_relative_torso": [
+      210,
+      120
+    ],
+    "video_sha256": "86e41e9d01c8aeae3487c1d0be523427d92203c1b7a8f45d251588324ecb23e7"
+  },
+  "guarded256_diag50": {
+    "sha256": "59f01013dc6c7b0da3077d49faee1c4ac28ac89fa4c55908d6c7ed1f3e479136",
+    "checkpoint_iteration": null,
+    "steps": 1500,
+    "dt": 0.02,
+    "ppo_updates": 0,
+    "conditions": "author play config, seed42, speed0.8m/s, relative heading0.5rad",
+    "phase_frame_counts": [
+      602.0,
+      678.0,
+      148.0,
+      72.0
+    ],
+    "resets": 0,
+    "minimum_root_height_m": 0.6598290205001831,
+    "fell_over_frames_above_70deg": 0,
+    "raw_board_contact_threshold_newtons": 5.0,
+    "steering_both_feet_board_fraction": 1.0,
+    "pushing_velocity_mae_mps": 0.1263602538362294,
+    "steering_heading_mae_rad": 0.3015169136110792,
+    "board_displacement_m": 26.652130126953125,
+    "limits": "One fixed-condition play rollout; play mode disables fall terminations. Not a success rate.",
+    "camera_azimuths_relative_torso": [
+      210,
+      120
+    ],
+    "video_sha256": "7299c80f06262dcb8f9cdf1e866672ebb605157bbd46b810f5b0081a4e286066"
+  },
+  "schema_version": 1,
+  "source_summary_sha256": "7f188ca41e013332559379c1bac3b2c01f4d328df1da20c563cbc7e644c1d6d2",
+  "comparison_scope": {
+    "different_algorithms": true,
+    "different_sample_workloads": true,
+    "timing_excludes_initialization_and_warmup": true,
+    "warm_start_from_original_husky_10000": true,
+    "cold_start_convergence_established": false,
+    "heldout_32_step_model_validation_established": false,
+    "equal_quality_convergence_speedup_established": false,
+    "physical_quality_evaluation_scope": "One fixed-seed, fixed-command 30-second play rollout per policy; not a success rate.",
+    "memory_scope": "peak_torch_allocated_bytes excludes MuJoCo/Warp, CUDA context and driver allocations."
+  }
+}

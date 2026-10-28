@@ -26,6 +26,7 @@ train = "mjlab_husky.scripts.train:main"
 play = "mjlab_husky.scripts.play:main"
 husky-train = "mjlab_husky.scripts.train:main"
 husky-play = "mjlab_husky.scripts.play:main"
+husky-supermimic = "mjlab_husky.supermimic.cli:main"
 
 [tool.ruff]
 src = ["src"]  # Helpful for recognizing first-party imports.

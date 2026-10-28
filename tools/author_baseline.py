@@ -84,6 +84,7 @@ def evaluate(out, checkpoint, steps, label):
     policy.eval()
     obs = wrapped.get_observations()
     qpos, phases, positions, commands, resets, heights = [], [], [], [], [], []
+    board_contact, ground_contact, tilt_angles, speed_errors, heading_errors = [], [], [], [], []
     with torch.inference_mode():
         for _ in range(steps):
             action = policy.act_inference(obs)
@@ -96,12 +97,31 @@ def evaluate(out, checkpoint, steps, label):
             commands.append(env.command_manager.get_command("skate")[0].cpu().numpy().copy())
             resets.append(bool(done[0]))
             heights.append(float(env.robot.data.root_link_pos_w[0, 2]))
+            # Read raw sensor tensors only; do not call the stateful contact-filter helpers.
+            contacts = []
+            for surface in ("board", "ground"):
+                values = [float(torch.linalg.vector_norm(env.scene.sensors[f"{side}_feet_{surface}_contact"].data.force[0], dim=-1).sum())
+                          for side in ("left", "right")]
+                contacts.append([value > 5.0 for value in values])
+            board_contact.append(contacts[0])
+            ground_contact.append(contacts[1])
+            tilt_angles.append(float(torch.acos((-env.robot.data.projected_gravity_b[0, 2]).clamp(-1, 1))))
+            command = env.command_manager.get_command("skate")[0]
+            q = env.skateboard.data.root_link_quat_w[0]
+            yaw = torch.atan2(2*(q[0]*q[3]+q[1]*q[2]), 1-2*(q[2]**2+q[3]**2))
+            velocity = env.skateboard.data.root_link_lin_vel_w[0]
+            forward = velocity[0]*yaw.cos()+velocity[1]*yaw.sin()
+            speed_errors.append(float((forward-command[0]).abs()))
+            target = env.command_manager.get_term("skate").target_heading_w[0]
+            heading_errors.append(float(torch.atan2((target-yaw).sin(), (target-yaw).cos()).abs()))
     out.mkdir(parents=True, exist_ok=True)
     (out / "data").mkdir(exist_ok=True)
     (out / "vedio").mkdir(exist_ok=True)
     (out / "image").mkdir(exist_ok=True)
     np.savez_compressed(out / "data" / f"{label}_trace.npz", qpos=qpos, phases=phases,
-                        board_position=positions, commands=commands, root_height=heights, resets=resets)
+                        board_position=positions, commands=commands, root_height=heights, resets=resets,
+                        board_contact=board_contact, ground_contact=ground_contact, tilt=tilt_angles,
+                        speed_error=speed_errors, heading_error=heading_errors)
     mujoco.mj_saveModel(env.sim.mj_model, str(out / "data" / f"{label}_scene.mjb"))
     video = render_trace(out, label, env.sim.mj_model, qpos, env.step_dt)
     write_json(out / "data" / f"{label}_evaluation.json", {
@@ -110,6 +130,11 @@ def evaluate(out, checkpoint, steps, label):
         "ppo_updates": 0, "conditions": "author play config, seed42, speed0.8m/s, relative heading0.5rad",
         "phase_frame_counts": np.asarray(phases).sum(0).tolist(),
         "resets": sum(resets), "minimum_root_height_m": min(heights),
+        "fell_over_frames_above_70deg": int((np.asarray(tilt_angles) > np.deg2rad(70)).sum()),
+        "raw_board_contact_threshold_newtons": 5.0,
+        "steering_both_feet_board_fraction": float(np.asarray(board_contact).all(-1)[np.asarray(phases)[:, 1] > 0.5].mean()),
+        "pushing_velocity_mae_mps": float(np.asarray(speed_errors)[np.asarray(phases)[:, 0] > 0.5].mean()),
+        "steering_heading_mae_rad": float(np.asarray(heading_errors)[np.asarray(phases)[:, 1] > 0.5].mean()),
         "board_displacement_m": float(np.linalg.norm(np.asarray(positions)[-1, :2] - np.asarray(positions)[0, :2])),
         "limits": "One fixed-condition play rollout; play mode disables fall terminations. Not a success rate.",
         "camera_azimuths_relative_torso": [210, 120], "video": str(video), "video_sha256": sha(video),

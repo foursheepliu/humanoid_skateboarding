@@ -19,7 +19,11 @@ class SuperMimicConfig:
     imagination_batch: int = 256
     hidden_width: int = 512
     model_lr: float = 3e-4
-    actor_lr: float = 3e-5
+    actor_lr: float = 3e-6
+    teacher_kl_coefficient: float = 10.0
+    teacher_kl_limit: float = 0.003
+    teacher_max_action_delta: float = 0.03
+    teacher_max_standardized_delta: float = 0.1
     critic_lr: float = 3e-4
     discriminator_lr: float = 1e-4
     discriminator_updates: int = 2

@@ -182,11 +182,11 @@ class EpisodeSequenceReplay:
             self._filter_refs[key] = env_ids
         return selected
 
-    def sample(self, batch_size, horizon=8, env_ids=None):
+    def sample(self, batch_size, horizon=8, env_ids=None, generator=None):
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
         choices = self._filtered_candidates(int(horizon), env_ids)
-        choice = choices[torch.randint(choices.shape[0], (int(batch_size),), device=self.device)]
+        choice = choices[torch.randint(choices.shape[0], (int(batch_size),), device=self.device, generator=generator)]
         slots = (choice[:, :1] + torch.arange(horizon, device=self.device)) % self.capacity_steps
         env = choice[:, 1:2].expand(-1, horizon)
         states = self.states[slots, env]
@@ -199,12 +199,16 @@ class EpisodeSequenceReplay:
     def state_dict(self):
         keys = ("states", "next_states", "actions", "rewards", "dones", "valid",
                 "terminated", "episode_ids", "context_ids", "_episode", "_context_bank")
+        tensors = {k: getattr(self, k).detach().to("cpu", copy=True) for k in keys}
+        # Unused ring rows are not samples. Never serialize uninitialized bytes
+        # or arbitrary NaNs from torch.empty into a partially filled snapshot.
+        if self.total_steps < self.capacity_steps:
+            for name in keys:
+                if name not in ("_episode", "_context_bank"):
+                    tensors[name][self.total_steps:].zero_()
         return {"version": 1, "shape": [self.num_envs, self.state_dim, self.action_dim,
                     self.context_dim, self.capacity_steps], "total_steps": self.total_steps,
-                # Copy directly to host. GPU clone followed by serialization can
-                # temporarily double a multi-GB CUDA replay and exhaust VRAM.
-                "context_id": self._context_id,
-                "tensors": {k: getattr(self, k).detach().to("cpu", copy=True) for k in keys}}
+                "context_id": self._context_id, "tensors": tensors}
 
     def load_state_dict(self, state):
         shape = [self.num_envs, self.state_dim, self.action_dim, self.context_dim, self.capacity_steps]

@@ -180,6 +180,35 @@ class ReplayTests(unittest.TestCase):
         torch.testing.assert_close(batch.context[..., 0], expected)
         self.assertEqual(restored._context_bank.shape[0], 2)
 
+    def test_partial_checkpoint_scrubs_only_unused_rows(self):
+        replay = EpisodeSequenceReplay(1, 2, 1, 0, 8)
+        replay.states.fill_(float("nan"))
+        replay.next_states.fill_(float("nan"))
+        context = torch.empty(1, 0)
+        for t in range(3):
+            replay.add(self.batch(t, context))
+        snapshot = replay.state_dict()
+        self.assertTrue(torch.isfinite(snapshot["tensors"]["states"]).all())
+        self.assertTrue((snapshot["tensors"]["states"][3:] == 0).all())
+        torch.testing.assert_close(snapshot["tensors"]["states"][:3], replay.states[:3])
+        replay.load_state_dict(snapshot)
+        self.assertTrue(torch.isfinite(replay.sample(4, 3).states).all())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA hardware test")
+    def test_cuda_transitions_can_enter_cpu_replay(self):
+        replay = EpisodeSequenceReplay(1, 2, 1, 0, 8, device="cpu")
+        context = torch.empty(1, 0, device="cuda")
+        for t in range(3):
+            batch = self.batch(t, context)
+            for name in ("state", "action", "next_state", "reward", "done", "valid_next", "terminated"):
+                value = getattr(batch, name)
+                if value is not None:
+                    setattr(batch, name, value.cuda())
+            replay.add(batch)
+        batch = replay.sample(4, 3)
+        self.assertEqual(batch.states.device.type, "cpu")
+        self.assertTrue(torch.isfinite(batch.states).all())
+
     def test_reject_insufficient_or_all_reset_windows(self):
         replay = EpisodeSequenceReplay(1, 2, 1, 0, 4)
         context = torch.empty(1, 0)
