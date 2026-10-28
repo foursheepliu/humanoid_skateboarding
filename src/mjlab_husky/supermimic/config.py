@@ -31,6 +31,8 @@ class SuperMimicConfig:
     model_precision: Literal["float32", "bfloat16"] = "float32"
     model_learning_rate: float = 2e-4
     actor_learning_rate: float = 2e-4
+    actor_adam_beta2: float = 0.999
+    actor_element_clip: float | None = None
     critic_learning_rate: float = 2e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -56,6 +58,13 @@ class SuperMimicConfig:
             raise ValueError("model_precision must be float32 or bfloat16")
         if self.critic_loss_profile not in ("legacy_survival_mean", "reference_time_sum"):
             raise ValueError("critic_loss_profile must be legacy_survival_mean or reference_time_sum")
+        if (isinstance(self.actor_adam_beta2, bool) or not math.isfinite(self.actor_adam_beta2)
+                or not 0 <= self.actor_adam_beta2 < 1):
+            raise ValueError("actor_adam_beta2 must be finite and in [0, 1)")
+        if self.actor_element_clip is not None and (
+                isinstance(self.actor_element_clip, bool) or not math.isfinite(self.actor_element_clip)
+                or self.actor_element_clip <= 0):
+            raise ValueError("actor_element_clip must be None or positive and finite")
         if not math.isfinite(self.real_exploration_std) or self.real_exploration_std < 0:
             raise ValueError("real_exploration_std must be finite and nonnegative")
         positive = ("real_steps", "horizon", "model_sequence_length", "model_batch_size",
@@ -103,6 +112,8 @@ class SuperMimicConfig:
         values.setdefault("analytic_action_cost", False)
         values.setdefault("model_precision", "float32")
         values.setdefault("critic_loss_profile", "legacy_survival_mean")
+        values.setdefault("actor_adam_beta2", 0.999)
+        values.setdefault("actor_element_clip", None)
         return cls.from_dict(values)
 
 

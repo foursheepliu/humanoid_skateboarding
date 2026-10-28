@@ -277,6 +277,23 @@ Checkpoints without the setting use the legacy objective. Full optimizer resume
 across objectives is rejected before state mutation; explicit weights-only
 initialization is allowed. Use fresh equal-budget runs for the comparison.
 
+## Optional reference actor optimizer
+
+`--supermimic.actor-adam-beta2 0.95 --supermimic.actor-element-clip 0.1`
+selects the reference actor Adam beta2 and elementwise gradient bound. The
+existing global norm clip runs first, followed by the elementwise clamp. Adam
+beta1 remains 0.9, epsilon 1e-8 and weight decay zero. The default beta2 is
+0.999 with no elementwise clamp, preserving the earlier update. Critic and
+world-model optimizers, task rewards, termination and policy inputs are unchanged.
+
+Missing checkpoint settings use the earlier defaults. Full optimizer resumes
+require matching configuration and saved actor optimizer hyperparameters before
+any state mutation; explicit weights-only initialization retains the new run's
+optimizer settings. CPU tests cover binding clamp/order and Adam moments; a
+bounded A5000 BF16/H32 update and native restoration passed with the reference
+settings. These checks establish integration, not faster learning or complete
+alignment with the reference training schedule.
+
 The source task and bundled RSL-RL retain their existing licenses. Reference
 links describe algorithm provenance; the new backend does not bundle LAFAN
 assets or pretrained checkpoints from the reference project.

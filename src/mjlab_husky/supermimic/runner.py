@@ -174,7 +174,9 @@ class SuperMimicRunner:
                 noise_parameter.requires_grad_(self.settings.actor_mode == "reparameterized")
                 if noise_parameter.requires_grad:
                     self._actor_parameters.append(noise_parameter)
-        self.actor_optimizer = torch.optim.Adam(self._actor_parameters, lr=self.settings.actor_learning_rate)
+        self.actor_optimizer = torch.optim.Adam(
+            self._actor_parameters, lr=self.settings.actor_learning_rate,
+            betas=(0.9, self.settings.actor_adam_beta2), eps=1e-8, weight_decay=0)
         self.critic_optimizer = torch.optim.Adam(self.policy.critic.parameters(), lr=self.settings.critic_learning_rate)
         self._bound_std()
         if self.log_dir is not None:
@@ -476,6 +478,12 @@ class SuperMimicRunner:
                 actor_loss.backward()
             norm = clip_grad_norm_(self._actor_parameters, self.settings.max_grad_norm,
                                    error_if_nonfinite=True)
+            if self.settings.actor_element_clip is not None:
+                # Match the reference ordering: global L2, then elementwise.
+                limit = self.settings.actor_element_clip
+                for parameter in self._actor_parameters:
+                    if parameter.grad is not None:
+                        parameter.grad.clamp_(-limit, limit)
             self.actor_optimizer.step()
             self._bound_std()
             self.actor_optimizer_updates += 1
@@ -649,6 +657,15 @@ class SuperMimicRunner:
                                  "Use load_optimizer=False explicitly to initialize weights for the changed objective.")
             if load_optimizer and asdict(saved_config) != asdict(self.settings):
                 raise ValueError("SuperMimic resume configuration differs from the checkpoint")
+            if load_optimizer:
+                groups = payload["actor_optimizer"].get("param_groups", [])
+                if len(groups) != len(self.actor_optimizer.param_groups):
+                    raise ValueError("Checkpoint actor optimizer parameter groups differ")
+                for group in groups:
+                    if tuple(group.get("betas", ())) != (0.9, saved_config.actor_adam_beta2):
+                        raise ValueError("Checkpoint actor optimizer betas differ from its saved configuration")
+                    if group.get("eps") != 1e-8 or group.get("weight_decay") != 0:
+                        raise ValueError("Checkpoint actor optimizer requires eps=1e-8 and weight_decay=0")
             if payload["adapter"] != self.adapter.metadata():
                 raise ValueError("Checkpoint training-state layout differs from this environment")
             model = payload["world_model"]

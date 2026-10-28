@@ -934,5 +934,114 @@ class RunnerTests(unittest.TestCase):
             self.make_runner(self.config(critic_loss_profile="not_a_profile"))
 
 
+    def test_actor_beta2_and_actual_element_clip_follow_global_clip_before_adam(self):
+        # Inject a known sparse backward signal at actor leaves so both clipping
+        # stages are active and their order can be observed at the real step.
+        for beta2 in (.999, .95):
+            for limit in (None, .1):
+                with self.subTest(beta2=beta2, element_clip=limit):
+                    runner = self.make_runner(self.config(actor_adam_beta2=beta2, actor_element_clip=limit))
+                    runner.collect(); runner.fit_world_model()
+                    parameters = list(runner.policy.actor.parameters())
+                    def controlled_gradient(gradient, first):
+                        result = torch.zeros_like(gradient)
+                        if first:
+                            result.flatten()[:2] = torch.tensor([10., 1.])
+                        return result
+                    handles = [parameter.register_hook(
+                        lambda gradient, first=index == 0: controlled_gradient(gradient, first))
+                        for index, parameter in enumerate(parameters)]
+                    observed = []
+                    handles.append(runner.actor_optimizer.register_step_pre_hook(
+                        lambda _optimizer, _args, _kwargs: observed.append(
+                            [parameter.grad.detach().clone() for parameter in parameters])))
+                    try:
+                        metrics = runner.update_actor_critic()
+                    finally:
+                        for handle in handles:
+                            handle.remove()
+                    expected = torch.tensor([10., 1.])
+                    expected *= (1 / (expected.norm() + 1e-6)).clamp(max=1)
+                    if limit is not None:
+                        expected = expected.clamp(-limit, limit)
+                    self.assertEqual(len(observed), 1)
+                    torch.testing.assert_close(observed[0][0].flatten()[:2], expected, rtol=0, atol=1e-7)
+                    self.assertFalse(observed[0][0].flatten()[2:].any())
+                    self.assertTrue(all(not gradient.any() for gradient in observed[0][1:]))
+                    self.assertAlmostEqual(metrics["actor/gradient_norm"], math.sqrt(101), places=5)
+                    group = runner.actor_optimizer.param_groups[0]
+                    self.assertEqual(group["betas"], (.9, beta2))
+                    self.assertEqual(group["eps"], 1e-8)
+                    self.assertEqual(group["weight_decay"], 0)
+                    state = runner.actor_optimizer.state[parameters[0]]
+                    torch.testing.assert_close(state["exp_avg"].flatten()[:2], .1 * expected)
+                    torch.testing.assert_close(state["exp_avg_sq"].flatten()[:2], (1 - beta2) * expected.square())
+
+    def test_actor_settings_native_old_and_optimizer_metadata_guards(self):
+        config = self.config(actor_adam_beta2=.95, actor_element_clip=.1,
+                             critic_loss_profile="reference_time_sum", checkpoint_replay=True)
+        def snapshot(runner):
+            return copy.deepcopy((runner.policy.state_dict(), runner.world_model.training_state_dict(),
+                                  runner.actor_optimizer.state_dict(), runner.critic_optimizer.state_dict(),
+                                  runner.amp.state_dict(), runner._rng.get_state(), runner.replay.state_dict()))
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.make_runner(config); runner.learn(2)
+            path = str(Path(directory) / "reference-actor.pt"); runner.save(path)
+            saved = torch.load(path, weights_only=False)
+            native = self.make_runner(config); native.load(path)
+            self.assert_tree_identical(native.policy.state_dict(), runner.policy.state_dict())
+            self.assert_tree_identical(native.actor_optimizer.state_dict(), runner.actor_optimizer.state_dict())
+            self.assert_tree_identical(native.critic_optimizer.state_dict(), runner.critic_optimizer.state_dict())
+            self.assertTrue(torch.equal(native._rng.get_state(), runner._rng.get_state()))
+            for changes in ({"actor_adam_beta2": .999}, {"actor_element_clip": None}):
+                changed_config = copy.deepcopy(config); changed_config["supermimic"].update(changes)
+                changed = self.make_runner(changed_config); before = snapshot(changed)
+                with self.assertRaisesRegex(ValueError, "configuration differs"):
+                    changed.load(path)
+                self.assert_tree_identical(before, snapshot(changed))
+                changed.load(path, load_optimizer=False)
+                self.assert_tree_identical(changed.policy.state_dict(), saved["model_state_dict"])
+                self.assertEqual(changed.actor_optimizer.param_groups[0]["betas"],
+                                 (.9, changed.settings.actor_adam_beta2))
+                self.assertEqual(len(changed.actor_optimizer.state), 0)
+            for field, value in (("betas", (.8, .95)), ("betas", (.9, .999)),
+                                 ("eps", 1e-6), ("weight_decay", .1)):
+                altered = copy.deepcopy(saved)
+                altered["supermimic"]["actor_optimizer"]["param_groups"][0][field] = value
+                bad_path = str(Path(directory) / "bad-optimizer.pt"); torch.save(altered, bad_path)
+                checked = self.make_runner(config); before = snapshot(checked)
+                with self.assertRaisesRegex(ValueError, "actor optimizer"):
+                    checked.load(bad_path)
+                self.assert_tree_identical(before, snapshot(checked))
+                # Explicit weights-only import never applies saved optimizer
+                # hyperparameters, so inconsistent moments cannot override cfg.
+                checked.load(bad_path, load_optimizer=False)
+                self.assertEqual(checked.actor_optimizer.param_groups[0]["betas"], (.9, .95))
+            old_config = self.config(checkpoint_replay=True)
+            old = self.make_runner(old_config); old.learn(1)
+            old_path = str(Path(directory) / "old.pt"); old.save(old_path)
+            checkpoint = torch.load(old_path, weights_only=False)
+            checkpoint["supermimic"]["config"].pop("actor_adam_beta2")
+            checkpoint["supermimic"]["config"].pop("actor_element_clip")
+            torch.save(checkpoint, old_path)
+            restored = self.make_runner(old_config); restored.load(old_path)
+            self.assertEqual(restored.settings.actor_adam_beta2, .999)
+            self.assertIsNone(restored.settings.actor_element_clip)
+            self.assert_tree_identical(restored.actor_optimizer.state_dict(), old.actor_optimizer.state_dict())
+            # The missing-field default is also checked against optimizer data.
+            checkpoint["supermimic"]["actor_optimizer"]["param_groups"][0]["betas"] = (.9, .95)
+            torch.save(checkpoint, old_path)
+            with self.assertRaisesRegex(ValueError, "betas differ"):
+                restored.load(old_path)
+
+    def test_actor_setting_validation(self):
+        for beta2 in (-.1, 1., float("nan"), float("inf"), True, False):
+            with self.subTest(beta2=beta2), self.assertRaisesRegex(ValueError, "actor_adam_beta2"):
+                self.make_runner(self.config(actor_adam_beta2=beta2))
+        for limit in (0., -.1, float("nan"), float("inf"), True, False):
+            with self.subTest(element_clip=limit), self.assertRaisesRegex(ValueError, "actor_element_clip"):
+                self.make_runner(self.config(actor_element_clip=limit))
+
+
 if __name__ == "__main__":
     unittest.main()
