@@ -345,6 +345,45 @@ class SuperMimicTrainerCheckpointTest(unittest.TestCase):
             self.assert_nested_equal(optimizer, trainer.actor_optimizer.state_dict())
             self.assertEqual(float(result["actor_teacher_kl"]), 0)
 
+    def test_resume_rejects_different_joint_geometry_before_loading_weights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = replace(make_trainer(directory).cfg, joint_consistency=True)
+            trainer = make_trainer(directory, config=cfg)
+            trainer.adapter = SimpleNamespace(joint_projection_variant="qpos-qvel-joints-v1",
+                joint_projection_metadata={"spec_sha256": "geometry-a"})
+            path = Path(directory) / "joint.pt"
+            trainer.save(path)
+            restored = make_trainer(directory, config=cfg, initialization_seed=103)
+            restored.adapter = SimpleNamespace(joint_projection_variant="qpos-qvel-joints-v1",
+                joint_projection_metadata={"spec_sha256": "geometry-b"})
+            before = copy.deepcopy(restored.policy.state_dict())
+            with self.assertRaisesRegex(ValueError, "joint geometry/defaults"):
+                restored.load(path)
+            self.assert_nested_equal(before, restored.policy.state_dict())
+            restored.adapter.joint_projection_metadata["spec_sha256"] = "geometry-a"
+            restored.load(path)
+            self.assert_nested_equal(trainer.policy.state_dict(), restored.policy.state_dict())
+
+    def test_older_conditional_snapshot_defaults_to_joint_projection_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = make_trainer(directory)
+            learning_step(trainer)
+            path = Path(directory) / "before_joint_option.pt"
+            trainer.save(path)
+            saved = torch.load(path, map_location="cpu", weights_only=False)
+            del saved["config"]["joint_consistency"]
+            saved.pop("projection_variant")
+            saved.pop("joint_projection_metadata")
+            torch.save(saved, path)
+            restored = make_trainer(directory, initialization_seed=103)
+            restored.load(path)
+            self.assertFalse(restored.cfg.joint_consistency)
+            self.assert_nested_equal(trainer.policy.state_dict(), restored.policy.state_dict())
+            expected = learning_step(trainer)
+            restored.load(path)
+            actual = learning_step(restored)
+            self.assert_nested_equal(expected, actual)
+
     def test_teacher_anchor_and_independent_validation_rng_roundtrip(self):
         with tempfile.TemporaryDirectory() as directory:
             trainer = make_trainer(directory)

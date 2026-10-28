@@ -4,6 +4,9 @@ Terminal physics is captured immediately before the simulator's reset. Its
 observation history is necessarily stale: those next-state regression targets
 are excluded rather than inventing a reset jump or advancing sensor RNG twice.
 """
+import copy
+import hashlib
+import json
 import math
 from types import MethodType
 
@@ -18,8 +21,49 @@ def _tensor(value, device):
     return torch.as_tensor(value, device=device)
 
 
+def joint_projection_spec_sha256(spec):
+    return hashlib.sha256(json.dumps(spec, sort_keys=True, separators=(",", ":"),
+                                     allow_nan=False).encode()).hexdigest()
+
+
+def _joint_scale(term, width):
+    value = torch.as_tensor(1.0 if term["scale"] is None else term["scale"], dtype=torch.float32)
+    value = value.detach().flatten()
+    if value.numel() == 1:
+        value = value.expand(width)
+    if value.numel() != width or not bool(torch.isfinite(value).all()):
+        raise ValueError("Joint observation scale must broadcast to all robot joints")
+    return value.cpu().tolist()
+
+
+def make_joint_projection_spec(layout, critic_terms, joint_names, qpos_addresses,
+                               qvel_addresses, default_joint_pos, default_joint_vel):
+    """Serialize constants only; no real transition or predicted physics enters."""
+    terms = {name: [term for term in critic_terms if term["name"] == name]
+             for name in ("joint_pos", "joint_vel")}
+    if any(len(items) != 1 for items in terms.values()):
+        raise ValueError("Need one unambiguous critic joint_pos and joint_vel term")
+    pos, vel = terms["joint_pos"][0], terms["joint_vel"][0]
+    width = len(joint_names)
+    if width != 23 or any(term["history"] != 1 or term["frame_dim"] != width for term in (pos, vel)):
+        raise ValueError("HUSKY joint projection requires 23 single-frame critic joints")
+    spec = {"format": "husky-supermimic-joint-projection-spec-v1", "variant": "qpos-qvel-joints-v1",
+            "state_dim": max(sl.stop for sl in layout.values()), "joint_names": list(joint_names)}
+    for name, values, dtype in (("qpos_addresses", qpos_addresses, torch.long),
+                                ("qvel_addresses", qvel_addresses, torch.long),
+                                ("default_joint_pos", default_joint_pos, torch.float32),
+                                ("default_joint_vel", default_joint_vel, torch.float32)):
+        spec[name] = torch.as_tensor(values, dtype=dtype).detach().cpu().flatten().tolist()
+    for name in ("qpos", "qvel", "amp_joints", "amp_history"):
+        spec[name + "_slice"] = [layout[name].start, layout[name].stop]
+    for name, term in (("joint_pos", pos), ("joint_vel", vel)):
+        spec["critic_" + name + "_slice"] = [term["slice"].start, term["slice"].stop]
+        spec["critic_" + name + "_scale"] = _joint_scale(term, width)
+    return spec
+
+
 class CoupledStateAdapter:
-    def __init__(self, env):
+    def __init__(self, env, joint_consistency=False):
         self.step_env = env
         self.env = getattr(env, "unwrapped", env)
         self.device = torch.device(self.env.device)
@@ -75,6 +119,35 @@ class CoupledStateAdapter:
         self.critic_terms = self._history_layout("critic")
         self.qpos_quaternion_slices = self._quaternion_layout()
         self.board_quaternion_slice = self._root_quaternion_slice("skateboard")
+        self.joint_consistency = False
+        self.joint_projection_variant = "none"
+        self.joint_projection_metadata = None
+        try:
+            indexing = self.env.robot.data.indexing
+            names = self.env.robot.joint_names
+            defaults = []
+            for name in ("default_joint_pos", "default_joint_vel"):
+                values = _tensor(getattr(self.env.robot.data, name), self.device).detach()
+                if values.ndim == 2:
+                    if not torch.equal(values, values[:1].expand_as(values)):
+                        raise ValueError("Per-environment default joints differ; a constant spec is invalid")
+                    values = values[0]
+                if values.shape != (23,) or not bool(torch.isfinite(values).all()):
+                    raise ValueError("Invalid default joint constants")
+                defaults.append(values)
+            spec = make_joint_projection_spec(self.layout, self.critic_terms, names,
+                indexing.joint_q_adr, indexing.joint_v_adr, *defaults)
+            self.set_joint_projection_metadata(spec)
+            self.joint_projection_metadata["provenance"] = {
+                "source": "live robot.data.indexing.joint_q_adr/joint_v_adr and default_joint_pos/default_joint_vel",
+                "default_vectors_identical_across_environments": True}
+        except (AttributeError, ValueError, KeyError) as error:
+            self.joint_projection_unavailable_reason = str(error)
+            self.joint_projection_metadata = None
+            if joint_consistency:
+                raise ValueError("Cannot enable consistent joint projection: " + str(error)) from error
+        self.joint_consistency = bool(joint_consistency)
+        self.joint_projection_variant = "qpos-qvel-joints-v1" if joint_consistency else "none"
         self.context_layout = {}
         self._context = self._make_context()
         self.context_dim = self._context.shape[-1]
@@ -106,6 +179,56 @@ class CoupledStateAdapter:
         if not value or "policy" not in value:
             value = self.env.observation_manager.compute(update_history=False)
         return value
+
+    def set_joint_projection_metadata(self, spec):
+        """Explicitly enable a validated constant spec on a live or offline adapter."""
+        if spec.get("format") != "husky-supermimic-joint-projection-spec-v1" or spec.get("variant") != "qpos-qvel-joints-v1":
+            raise ValueError("Unsupported joint projection spec")
+        expected = make_joint_projection_spec(self.layout, self.critic_terms, spec["joint_names"],
+            spec["qpos_addresses"], spec["qvel_addresses"], spec["default_joint_pos"], spec["default_joint_vel"])
+        if spec != expected:
+            raise ValueError("Joint spec differs from adapter dimensions, terms or canonical FP32 constants")
+        if len(set(spec["joint_names"])) != 23:
+            raise ValueError("Robot joint names must be unique")
+        for name, block in (("qpos_addresses", "qpos"), ("qvel_addresses", "qvel")):
+            values = spec[name]
+            if (len(values) != 23 or len(set(values)) != 23 or
+                    any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+                        or value >= self.layout[block].stop-self.layout[block].start for value in values)):
+                raise ValueError("Joint addresses must be unique in-range integer simulator coordinates")
+        if (self.layout["amp_joints"].stop-self.layout["amp_joints"].start != 23 or
+                self.layout["amp_history"].stop-self.layout["amp_history"].start != 5*23):
+            raise ValueError("AMP fields must contain 23 joints and five frames")
+        for name in ("default_joint_pos", "default_joint_vel"):
+            values = torch.as_tensor(spec[name], dtype=torch.float32)
+            if values.shape != (23,) or not bool(torch.isfinite(values).all()):
+                raise ValueError("Default joint constants must be 23 finite values")
+        self.joint_projection_metadata = {"spec": copy.deepcopy(spec),
+            "spec_sha256": joint_projection_spec_sha256(spec), "provenance": {"source": "explicit constant spec"}}
+        self.joint_consistency = True
+        self.joint_projection_variant = "qpos-qvel-joints-v1"
+        self._joint_projection_cache = {}
+
+    def _project_consistent_joints(self, result):
+        spec = self.joint_projection_metadata["spec"]
+        key = (result.device, result.dtype)
+        if key not in self._joint_projection_cache:
+            # A baseline audit may warm this cache under inference_mode. These
+            # constants must still be ordinary tensors that backward can save.
+            with torch.inference_mode(False):
+                self._joint_projection_cache[key] = {name: torch.tensor(spec[name], device=result.device,
+                    dtype=torch.long if name.endswith("addresses") else result.dtype, requires_grad=False)
+                    for name in ("qpos_addresses", "qvel_addresses", "default_joint_pos", "default_joint_vel",
+                                 "critic_joint_pos_scale", "critic_joint_vel_scale")}
+        constants = self._joint_projection_cache[key]
+        # Clones isolate saved backward operands from subsequent exact writes.
+        joints = result[..., self.layout["qpos"]][..., constants["qpos_addresses"]].clone()
+        velocity = result[..., self.layout["qvel"]][..., constants["qvel_addresses"]].clone()
+        result[..., self.layout["amp_joints"]] = joints
+        result[..., slice(*spec["critic_joint_pos_slice"])] = (
+            joints-constants["default_joint_pos"])*constants["critic_joint_pos_scale"]
+        result[..., slice(*spec["critic_joint_vel_slice"])] = (
+            velocity-constants["default_joint_vel"])*constants["critic_joint_vel_scale"]
 
     def _batch(self, value):
         t = _tensor(value, self.device)
@@ -337,6 +460,8 @@ class CoupledStateAdapter:
         for name in ("command_b", "is_heading_env", "is_standing_env", "still"):
             if name in self.layout:
                 result[..., self.layout[name]] = previous[..., self.layout[name]]
+        if getattr(self, "joint_consistency", False):
+            self._project_consistent_joints(result)
         if "amp_history" in self.layout:
             hist = previous[..., self.layout["amp_history"]].reshape(*previous.shape[:-1], 5, 23)
             joints = result[..., self.layout["amp_joints"]][..., None, :]

@@ -1,5 +1,6 @@
 """A bounded, 24-GB 4090 starting profile for the coupled-world-model backend."""
 from dataclasses import dataclass
+import math
 
 
 @dataclass
@@ -34,8 +35,16 @@ class SuperMimicConfig:
     log_interval: int = 10
     expert_transitions: int = 200000
     mixed_precision: str = "none"
+    joint_consistency: bool = False
 
     def validate(self):
+        for name in ("model_lr", "actor_lr", "critic_lr", "discriminator_lr", "teacher_kl_limit",
+                     "teacher_max_action_delta", "teacher_max_standardized_delta"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        for name in ("collection_noise", "teacher_kl_coefficient"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
         for name in ("num_envs", "iterations", "replay_steps", "warmup_steps", "collect_steps",
                      "collect_interval", "model_window", "model_updates", "model_batch",
                      "imagination_horizon", "imagination_batch", "save_interval", "log_interval"):

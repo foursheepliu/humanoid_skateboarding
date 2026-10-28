@@ -72,7 +72,7 @@ This branch preserves the released task and learning algorithm. It adds a locked
 
 ## SuperMimic robot–skateboard backend
 
-This branch adds a separate learned coupled-world-model and BPTT learner while preserving the original HUSKY task. It uses 8-step autoregressive fitting, 32-step imagined actor rollouts and retained adversarial pushing style. See [4090 setup, commands, tests and limits](docs/supermimic_4090.md). This is an experimental task adaptation; throughput measurements are not evidence of equal-quality convergence or sim-to-real readiness.
+This branch adds a separate learned coupled-world-model and BPTT learner while preserving the original HUSKY task. Defaults remain eager FP32, 8-step model fitting, 32-step actor imagination and strict warm-start teacher constraints. Joint consistency is an explicit experimental opt-in. Fixed-data world refinement improved prediction errors, but the 500-iteration paired policy diagnostic did not show a meaningful improvement over the 10K teacher. BF16 and compiled world forward were slower in the measured workloads; full-loss compilation failed. See [4090 setup, commands, evidence and limits](docs/supermimic_4090.md). Lower iteration latency has **not** established faster convergence to equal skateboarding quality or sim-to-real readiness.
 
 ## Training Example
 

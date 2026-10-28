@@ -173,7 +173,7 @@
     ],
     "video_sha256": "7299c80f06262dcb8f9cdf1e866672ebb605157bbd46b810f5b0081a4e286066"
   },
-  "schema_version": 1,
+  "schema_version": 3,
   "source_summary_sha256": "7f188ca41e013332559379c1bac3b2c01f4d328df1da20c563cbc7e644c1d6d2",
   "comparison_scope": {
     "different_algorithms": true,
@@ -255,5 +255,368 @@
         "reward_raw_mae": 0.019056345237459027
       }
     }
+  },
+  "nightly_refinement_joint_precision_500": {
+    "p1_world_refinement": {
+      "world_optimizer_steps": 1000,
+      "actor_optimizer_steps": 0,
+      "critic_optimizer_steps": 0,
+      "model_window": 16,
+      "training_seconds": 83.03640846558847,
+      "validation_seconds": 17.172654872993007,
+      "nominal_fitting_transitions": 4096000,
+      "normalizers_unchanged": true,
+      "initial_world_state_sha256": "c47d809dd40c0f9d6e6a9039e274ed9b8553b2afd5a638317382db5fd908d366",
+      "frozen_normalizers_sha256": "e4517efcab126d2944d58cbe2621f2fe712ec9b76923023d5bfd57aebaa1cee9",
+      "replay_corpus_sha256": "319489e523a9e9068bd83cea5145d16f6e6a7b42a5643ec2c2704988fb211524",
+      "audit_batch_sha256": "7451f71cc7f39a5c6b9c2da6659c7a4082d6670b97070e7044b4efb97d7e050c",
+      "initial_fixed32_raw_rmse": {
+        "robot_root_position": 0.04188362763725599,
+        "skateboard_root_position": 0.03826360134801063,
+        "robot_joint_velocity": 0.930685182183944,
+        "policy": 0.05234854003431249,
+        "task_reward": 0.03817945167362086
+      },
+      "final_fixed32_raw_rmse": {
+        "robot_root_position": 0.02315204927583103,
+        "skateboard_root_position": 0.019898312765771725,
+        "robot_joint_velocity": 0.7451009308650394,
+        "policy": 0.04031567729596387,
+        "task_reward": 0.0322647972641646
+      },
+      "source_artifact_sha256": "3b1bab3421a2b6c2ff0788a65e1bd8c73e00c082a13e758eb735d1438fa80c3e"
+    },
+    "joint_projection": {
+      "default_enabled": false,
+      "variant": "qpos-qvel-joints-v1",
+      "spec_sha256": "1e4568b8931bf71972256b047aa401d2bdf1d33fc0b72f6f662d4296b62b39c7",
+      "state_dim": 1443,
+      "context_dim": 1645,
+      "training_formula_validation": {
+        "amp_max_abs": 0.0,
+        "critic_position_max_abs": 0.0,
+        "critic_velocity_max_abs": 0.0,
+        "stored_state_rows": 65280,
+        "valid_next_rows": 65275
+      },
+      "heldout_formula_validation": {
+        "amp_max_abs": 0.0,
+        "critic_position_max_abs": 0.0,
+        "critic_velocity_max_abs": 0.0,
+        "stored_state_rows": 16640,
+        "valid_next_rows": 16637
+      },
+      "uniqueness_from_training_only": {
+        "amp_unique": true,
+        "critic_position_unique": true,
+        "critic_velocity_unique": true,
+        "nonmatching_amp_min_max_abs": 0.5892665982246399,
+        "nonmatching_position_min_offset_range": 0.871359646320343,
+        "nonmatching_velocity_min_max_abs": 0.31137633323669434
+      },
+      "metadata_artifact_sha256": "ec8ace0f913b5ab675fe2d8075ebd8fc538b6ac4d3239c57f923067e5dc9f2cf"
+    },
+    "online_p1_500": {
+      "status": "completed",
+      "iterations": 500,
+      "real_env_steps": 6430720,
+      "elapsed_seconds": 405.11156392097473,
+      "warmup_seconds": 16.91387701034546,
+      "accepted_actor_steps": 500.0,
+      "stable_mean_last30_seconds": 0.7668591367779299,
+      "all_logged_scalars_finite": true,
+      "max_teacher_kl": 0.0029998363461345434,
+      "max_raw_action_delta": 0.029877007007598877,
+      "max_standardized_action_delta": 0.09949759393930435,
+      "training_exit_sha256": "dd704188407d36e2190e1ae9bd059446340e8f6e66bb442e209906717c5bc211",
+      "online_configuration": {
+        "model_window": 8,
+        "model_updates": 10,
+        "model_batch": 256,
+        "imagination_horizon": 32,
+        "joint_consistency": true,
+        "actor_lr": 3e-06,
+        "teacher_kl_limit": 0.003,
+        "teacher_max_action_delta": 0.03,
+        "teacher_max_standardized_delta": 0.1
+      }
+    },
+    "paired_policy_evaluation": {
+      "protocol": {
+        "task": "Mjlab-Skater-Flat-Unitree-G1",
+        "seed": 42,
+        "num_envs": 64,
+        "steps_requested": 1500,
+        "control_dt_seconds": 0.02,
+        "speed_command_range_mps": [
+          0.0,
+          1.5
+        ],
+        "relative_heading_range_rad": [
+          -0.7853981633974483,
+          0.7853981633974483
+        ],
+        "policy": "deterministic mean",
+        "training_noise": false,
+        "observation_corruption": false,
+        "interval_robot_push": false,
+        "episode_time_limit_seconds": 60,
+        "fall_terminations_enabled": false,
+        "raw_board_contact_threshold_newtons": 5.0,
+        "tilt_threshold_degrees": 70.0,
+        "task_return_semantics": "Unchanged environment task reward, summed over play steps; excludes adversarial style added by the training runner"
+      },
+      "policies": {
+        "teacher10k": {
+          "aggregate": {
+            "num_envs": 64,
+            "num_ever_fell_over_70deg": 6,
+            "diagnostic_ever_fell_fraction": 0.09375,
+            "minimum_root_height_m": 0.06424079835414886,
+            "maximum_root_tilt_degrees": 163.03993225097656,
+            "total_resets": 0,
+            "nonfinite_envs": 0,
+            "mean_task_return_excluding_amp": 304.3452516269331,
+            "pooled_pushing_velocity_mae_mps": 0.1336054114807928,
+            "pooled_steering_heading_mae_rad": 0.22145571447492313,
+            "pooled_steering_both_feet_board_fraction": 0.9963807907348243
+          },
+          "policy_sha256": "528560e39ab45fe25c08fa4bac37c5795fe2fdd0054fb644f208e1e33d77275d",
+          "initial_conditions_sha256": "d39ab1d37c7799ab05a7f64ad375944ac50675ac40aa0e7119597565e8f4a398",
+          "raw_command_sequence_sha256": "b7d31ea11d8c4c37781b53d5b9d7a73a6aba413e6afc3226ad038ea02f1ef42d",
+          "evaluator_sha256": "768501f2c4be9dda22801404b1d7e98126737ce6b43ad7e01b5079b5c0dabacc",
+          "checkpoint_iteration": 9999,
+          "steps_completed": 1500,
+          "source_artifact_sha256": "82b1cd116882ceec140a29b78a2d53c9b6912d0567de50e6a2bbaf60358d5dad"
+        },
+        "p1_refined50": {
+          "aggregate": {
+            "num_envs": 64,
+            "num_ever_fell_over_70deg": 5,
+            "diagnostic_ever_fell_fraction": 0.078125,
+            "minimum_root_height_m": 0.06879650801420212,
+            "maximum_root_tilt_degrees": 167.9930877685547,
+            "total_resets": 0,
+            "nonfinite_envs": 0,
+            "mean_task_return_excluding_amp": 305.4450253233068,
+            "pooled_pushing_velocity_mae_mps": 0.13810618959517582,
+            "pooled_steering_heading_mae_rad": 0.22593696141383424,
+            "pooled_steering_both_feet_board_fraction": 0.9986771166134185
+          },
+          "policy_sha256": "fd5e6fa8b080c3a0a0fef91c911b7bc1d28cbc8be89e503f08e05c9decb62f79",
+          "initial_conditions_sha256": "d39ab1d37c7799ab05a7f64ad375944ac50675ac40aa0e7119597565e8f4a398",
+          "raw_command_sequence_sha256": "b7d31ea11d8c4c37781b53d5b9d7a73a6aba413e6afc3226ad038ea02f1ef42d",
+          "evaluator_sha256": "768501f2c4be9dda22801404b1d7e98126737ce6b43ad7e01b5079b5c0dabacc",
+          "checkpoint_iteration": 50,
+          "steps_completed": 1500,
+          "source_artifact_sha256": "6ae5629d1e9041a6a10cc93ff8e47b598bbf9f98f9a70ae412e1e2c180220ca3"
+        },
+        "p1_500": {
+          "aggregate": {
+            "num_envs": 64,
+            "num_ever_fell_over_70deg": 6,
+            "diagnostic_ever_fell_fraction": 0.09375,
+            "minimum_root_height_m": 0.06795644015073776,
+            "maximum_root_tilt_degrees": 175.51171875,
+            "total_resets": 0,
+            "nonfinite_envs": 0,
+            "mean_task_return_excluding_amp": 304.6646664340469,
+            "pooled_pushing_velocity_mae_mps": 0.13640305351506077,
+            "pooled_steering_heading_mae_rad": 0.22229284105804592,
+            "pooled_steering_both_feet_board_fraction": 0.9961062300319489
+          },
+          "policy_sha256": "6819828ea9df486f4f56fbafc9a44a1572a9b520453eb217372bd211d1736138",
+          "initial_conditions_sha256": "d39ab1d37c7799ab05a7f64ad375944ac50675ac40aa0e7119597565e8f4a398",
+          "raw_command_sequence_sha256": "b7d31ea11d8c4c37781b53d5b9d7a73a6aba413e6afc3226ad038ea02f1ef42d",
+          "evaluator_sha256": "768501f2c4be9dda22801404b1d7e98126737ce6b43ad7e01b5079b5c0dabacc",
+          "checkpoint_iteration": 500,
+          "steps_completed": 1500,
+          "source_artifact_sha256": "be84cf55629a868efd57d0b21aa2965d113718d17bbec9369fa13570118a60a0"
+        }
+      },
+      "identical_initial_conditions": true,
+      "identical_command_sequences": true,
+      "scope": "One paired seed,64 environments,30-second play. Tilt diagnostic is not task success. No statistically established policy improvement or equal-quality convergence speedup."
+    },
+    "full_loss_compile": {
+      "adopted": false,
+      "completed_compiled_result_available": false,
+      "attempts": [
+        {
+          "label": "loss_compile_conditional50",
+          "stage": "failed",
+          "optimizer_steps": 0,
+          "error_type": "InductorError",
+          "compiler_error": "RuntimeError: PassManager::run failed",
+          "elapsed_until_failure_seconds": 38.38036632537842,
+          "inductor_options": {},
+          "source_artifact_sha256": "30beebd67d5fb503eb02cd6224f6327369548dcd5f675d5e75bbc0f93208132e"
+        },
+        {
+          "label": "loss_compile_fusion16",
+          "stage": "failed",
+          "optimizer_steps": 0,
+          "error_type": "InductorError",
+          "compiler_error": "RuntimeError: PassManager::run failed",
+          "elapsed_until_failure_seconds": 35.73591685295105,
+          "inductor_options": {
+            "triton.cudagraphs": false,
+            "max_fusion_size": 16,
+            "epilogue_fusion": false
+          },
+          "source_artifact_sha256": "ca8b406c0bb66b0a1602d309ec74542219d3e861e59af750aa2250cf824bae06"
+        }
+      ]
+    },
+    "world_refinement": {
+      "real_corpus_environments": 128,
+      "real_corpus_steps_per_environment": 640,
+      "train_environments": 102,
+      "heldout_environments": 26,
+      "fixed_audit_windows": 256,
+      "fixed_audit_horizon": 32,
+      "optimizer": "fresh Adam at original model LR",
+      "norms_refitted": false,
+      "window_runs": {
+        "8": {
+          "world_optimizer_steps": 1000,
+          "actor_optimizer_steps": 0,
+          "critic_optimizer_steps": 0,
+          "training_seconds": 39.72295298008248,
+          "validation_seconds": 17.319007526384667,
+          "nominal_fitting_transitions": 2048000,
+          "normalizers_unchanged": true,
+          "initial_world_state_sha256": "c47d809dd40c0f9d6e6a9039e274ed9b8553b2afd5a638317382db5fd908d366",
+          "frozen_normalizers_sha256": "e4517efcab126d2944d58cbe2621f2fe712ec9b76923023d5bfd57aebaa1cee9",
+          "replay_corpus_sha256": "319489e523a9e9068bd83cea5145d16f6e6a7b42a5643ec2c2704988fb211524",
+          "audit_batch_sha256": "7451f71cc7f39a5c6b9c2da6659c7a4082d6670b97070e7044b4efb97d7e050c",
+          "initial_fixed32_raw_rmse": {
+            "robot_root_position": 0.04185220140961383,
+            "skateboard_root_position": 0.038150526421537,
+            "robot_joint_velocity": 0.934409646771232,
+            "policy": 0.05235249158146463,
+            "task_reward": 0.038169735301760974
+          },
+          "final_fixed32_raw_rmse": {
+            "robot_root_position": 0.02630908874072212,
+            "skateboard_root_position": 0.022624112771915773,
+            "robot_joint_velocity": 0.8246383393971707,
+            "policy": 0.04401644786994946,
+            "task_reward": 0.03469768043343038
+          },
+          "source_artifact_sha256": "522684687ec2d1500fba5031b342d91b3d78a9a42f58eb4fa45f07986dd8668e"
+        },
+        "16": {
+          "world_optimizer_steps": 1000,
+          "actor_optimizer_steps": 0,
+          "critic_optimizer_steps": 0,
+          "training_seconds": 78.2075122257229,
+          "validation_seconds": 16.831240928266197,
+          "nominal_fitting_transitions": 4096000,
+          "normalizers_unchanged": true,
+          "initial_world_state_sha256": "c47d809dd40c0f9d6e6a9039e274ed9b8553b2afd5a638317382db5fd908d366",
+          "frozen_normalizers_sha256": "e4517efcab126d2944d58cbe2621f2fe712ec9b76923023d5bfd57aebaa1cee9",
+          "replay_corpus_sha256": "319489e523a9e9068bd83cea5145d16f6e6a7b42a5643ec2c2704988fb211524",
+          "audit_batch_sha256": "7451f71cc7f39a5c6b9c2da6659c7a4082d6670b97070e7044b4efb97d7e050c",
+          "initial_fixed32_raw_rmse": {
+            "robot_root_position": 0.04185220140961383,
+            "skateboard_root_position": 0.038150526421537,
+            "robot_joint_velocity": 0.934409646771232,
+            "policy": 0.05235249158146463,
+            "task_reward": 0.038169735301760974
+          },
+          "final_fixed32_raw_rmse": {
+            "robot_root_position": 0.024444642139171645,
+            "skateboard_root_position": 0.020767820727768078,
+            "robot_joint_velocity": 0.775796193765105,
+            "policy": 0.04060650516223003,
+            "task_reward": 0.03295182484046978
+          },
+          "source_artifact_sha256": "c6c8ccd66b94f27329ff4601a6f4cba3e2fad2a7c712cd90bf459fc8e121ae6d"
+        }
+      },
+      "scope": "Same starting model, frozen norms and corpus.1000 optimizer steps with window16 fit twice the nominal transitions of window8; not a compute-matched speed comparison."
+    },
+    "precision_and_compile": {
+      "default": "eager FP32 with original mjlab TF32 permissions",
+      "bf16_adopted": false,
+      "bf16": {
+        "gradient_cosine": 0.9993989159517741,
+        "gradient_relative_l2": 0.03880077871062429,
+        "provisional_numerical_gates_passed": true,
+        "world8_fp32_median_seconds": 0.032777911983430386,
+        "world8_bf16_median_seconds": 0.034825080540031195,
+        "speed_ratio_fp32_over_bf16": 0.9412156835000682,
+        "optimizer_steps": 0,
+        "source_artifact_sha256": "b031ddfc6726da91fcff0d45133aa5c0a000e29c5a53c76c42ea77e6640a1add"
+      },
+      "compiled_world_forward": {
+        "adopted": false,
+        "gradient_cosine": 0.9999998877149777,
+        "gradient_relative_l2": 0.0005219711761121095,
+        "provisional_numerical_gates_passed": true,
+        "optimizer_steps": 0,
+        "workloads": {
+          "world8": {
+            "eager_median_seconds": 0.03249162051361054,
+            "compiled_median_seconds": 0.033801082987338305,
+            "speed_ratio_eager_over_compiled": 0.9612597479726233
+          },
+          "imagination32": {
+            "eager_median_seconds": 0.12733485805802047,
+            "compiled_median_seconds": 0.1305575375445187,
+            "speed_ratio_eager_over_compiled": 0.9753160212186192
+          }
+        },
+        "source_artifact_sha256": "721696a3be3852ceaeacb940d21c72c553c8c08131cea04f92f3217630ca457b"
+      },
+      "fresh_process_tf32_compatibility_eager_identity": {
+        "tensor_value_hashes_equal": true,
+        "combined_tensor_value_sha256_equal": true,
+        "checked_tensor_names": [
+          "rollout_states",
+          "rollout_rewards",
+          "rollout_failure_probability",
+          "actor_gradient32"
+        ],
+        "world_state_sha256_equal": true,
+        "policy_state_sha256_equal": true,
+        "scope": "Identical eager tensor values for these same weights/inputs only; no global equivalence or training-speed claim."
+      }
+    },
+    "wide_teacher_guard": {
+      "adopted": false,
+      "limits": {
+        "mean_kl": 0.01,
+        "max_raw_action_delta": 0.1,
+        "max_standardized_delta": 0.3
+      },
+      "tight_refined50_earlier_protocol": {
+        "num_envs": 64,
+        "num_ever_fell_over_70deg": 5,
+        "diagnostic_ever_fell_fraction": 0.078125,
+        "minimum_root_height_m": 0.07543199509382248,
+        "maximum_root_tilt_degrees": 175.2652587890625,
+        "total_resets": 0,
+        "nonfinite_envs": 0,
+        "pooled_pushing_velocity_mae_mps": 0.1345730325998165,
+        "pooled_steering_heading_mae_rad": 0.22320353908660695,
+        "pooled_steering_both_feet_board_fraction": 0.9998502396166135
+      },
+      "wide_refined50_earlier_protocol": {
+        "num_envs": 64,
+        "num_ever_fell_over_70deg": 7,
+        "diagnostic_ever_fell_fraction": 0.109375,
+        "minimum_root_height_m": 0.06367270648479462,
+        "maximum_root_tilt_degrees": 179.1634979248047,
+        "total_resets": 0,
+        "nonfinite_envs": 0,
+        "pooled_pushing_velocity_mae_mps": 0.1468814429943757,
+        "pooled_steering_heading_mae_rad": 0.2288587732811848,
+        "pooled_steering_both_feet_board_fraction": 0.9930860623003195
+      },
+      "scope": "Earlier paired evaluator; not pooled with the later task-return protocol. Wider limits degraded observed tilt count/tracking in this sample."
+    },
+    "equal_quality_convergence_speedup_established": false
   }
 }

@@ -98,7 +98,7 @@ class SuperMimicTrainer:
         self.paths = {name: self.out / name / run_name for name in ("log", "configs", "data", "checkpoints")}
         for directory in self.paths.values():
             directory.mkdir(parents=True, exist_ok=True)
-        self.adapter = CoupledStateAdapter(env)
+        self.adapter = CoupledStateAdapter(env, joint_consistency=config.joint_consistency)
         self.world = WorldModel(self.adapter.state_dim, env.action_manager.total_action_dim,
                                 self.adapter.context_dim,
                                 hidden_dims=(config.hidden_width,) * 3).to(self.device)
@@ -336,6 +336,8 @@ class SuperMimicTrainer:
         """Restore learning state; simulator continuation starts a new real rollout."""
         checkpoint = {"format": "husky-supermimic-v1", "model_state_dict": self.policy.state_dict(),
             "dynamics_protocol": "conditional-commands-v2",
+            "projection_variant": getattr(getattr(self, "adapter", None), "joint_projection_variant", "none"),
+            "joint_projection_metadata": getattr(getattr(self, "adapter", None), "joint_projection_metadata", None),
             "world": self.world.state_dict(), "discriminator": self.discriminator.state_dict(),
             "style_normalizer": self.style_norm.state_dict(), "config": asdict(self.cfg),
             "iteration": self.iteration, "real_steps": self.real_steps,
@@ -362,10 +364,19 @@ class SuperMimicTrainer:
         if checkpoint.get("dynamics_protocol") != "conditional-commands-v2":
             raise ValueError("World-model command protocol differs; explicit migration is required")
         saved_config, requested_config = dict(checkpoint["config"]), asdict(self.cfg)
+        # Older v2 snapshots have the same computation as the default-off path.
+        saved_config.setdefault("joint_consistency", False)
         saved_config.pop("iterations")
         requested_config.pop("iterations")
         if saved_config != requested_config:
             raise ValueError("Resume learning/state config differs; explicit migration is required")
+        if self.cfg.joint_consistency:
+            saved_spec = checkpoint.get("joint_projection_metadata") or {}
+            current_spec = getattr(self.adapter, "joint_projection_metadata", None) or {}
+            if (checkpoint.get("projection_variant") != self.adapter.joint_projection_variant
+                    or not current_spec.get("spec_sha256")
+                    or saved_spec.get("spec_sha256") != current_spec["spec_sha256"]):
+                raise ValueError("Resume joint geometry/defaults metadata differs")
         if self.cfg.iterations < checkpoint["iteration"]:
             raise ValueError("Requested cap is below already completed iterations")
         self.policy.load_state_dict(checkpoint["model_state_dict"])

@@ -166,6 +166,7 @@ def main():
                     "fall_terminations_enabled": False,
                     "raw_board_contact_threshold_newtons": 5.0,
                     "tilt_threshold_degrees": 70.0}
+        protocol["task_return_semantics"] = "Unchanged environment task reward, summed over play steps; excludes adversarial style added by the training runner"
         initial_identity = canonical_sha256({"protocol": protocol, "environments": initial})
         device = env.device
         n = args.num_envs
@@ -180,6 +181,7 @@ def main():
         velocity_error_sum = torch.zeros(n, device=device, dtype=torch.float64)
         heading_error_sum = torch.zeros(n, device=device, dtype=torch.float64)
         bilateral_frames = torch.zeros(n, device=device, dtype=torch.long)
+        task_returns = torch.zeros(n, device=device, dtype=torch.float64)
         commands = torch.empty((args.steps, n, 2), device=device)
         trace = {key: [] for key in ("qpos", "root_height", "root_tilt_degrees", "phase",
                                       "commands", "board_forward_speed", "heading_error",
@@ -214,7 +216,9 @@ def main():
                     left_force = board_force_norm("left_feet_board_contact")
                     right_force = board_force_norm("right_feet_board_contact")
                     finite = (torch.isfinite(height) & torch.isfinite(tilt) & torch.isfinite(velocity)
-                              & torch.isfinite(yaw_error) & torch.isfinite(left_force) & torch.isfinite(right_force))
+                              & torch.isfinite(yaw_error) & torch.isfinite(left_force) & torch.isfinite(right_force)
+                              & torch.isfinite(reward))
+                    task_returns += torch.where(finite, reward, 0).double()
                     nonfinite_frames += (~finite).long()
                     min_height = torch.minimum(min_height, torch.where(finite, height, min_height))
                     max_tilt = torch.maximum(max_tilt, torch.where(finite, tilt, max_tilt))
@@ -250,6 +254,7 @@ def main():
             "pushing_frames": push_frames, "steering_frames": steer_frames,
             "velocity_error_sum": velocity_error_sum, "heading_error_sum": heading_error_sum,
             "steering_bilateral_contact_frames": bilateral_frames}.items()}
+        host["task_returns"] = cpu_array(task_returns)
         command_array = cpu_array(commands[:completed])
         per_env = []
         for index in range(n):
@@ -260,6 +265,7 @@ def main():
                     "ever_fell_over_70deg": bool(host["fell_over_frames_above_70deg"][index] > 0),
                     "first_fell_over_step": int(host["first_fell_over_step"][index]),
                     "resets": int(host["resets"][index]), "nonfinite_frames": int(host["nonfinite_frames"][index]),
+                    "task_return_excluding_amp": float(host["task_returns"][index]),
                     "pushing_frames": int(host["pushing_frames"][index]),
                     "steering_frames": int(host["steering_frames"][index]),
                     "pushing_velocity_mae_mps": optional_ratio(host["velocity_error_sum"][index], host["pushing_frames"][index]),
@@ -294,6 +300,7 @@ def main():
                       "minimum_root_height_m": min(x["minimum_root_height_m"] for x in per_env),
                       "maximum_root_tilt_degrees": max(x["maximum_root_tilt_degrees"] for x in per_env),
                       "total_resets": int(host["resets"].sum()), "nonfinite_envs": sum(x["nonfinite_frames"] > 0 for x in per_env),
+                      "mean_task_return_excluding_amp": float(host["task_returns"].mean()),
                       "pooled_pushing_velocity_mae_mps": optional_ratio(host["velocity_error_sum"].sum(), host["pushing_frames"].sum()),
                       "pooled_steering_heading_mae_rad": optional_ratio(host["heading_error_sum"].sum(), host["steering_frames"].sum()),
                       "pooled_steering_both_feet_board_fraction": optional_ratio(host["steering_bilateral_contact_frames"].sum(), host["steering_frames"].sum())},
