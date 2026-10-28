@@ -12,6 +12,7 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
     "mjlab",
     "onnxruntime",
+    "scipy>=1.16,<1.18",
     "pybullet",
     "rsl-rl-lib",
     "pynput"
@@ -23,6 +24,8 @@ mjlab_husky = "mjlab_husky.tasks"
 [project.scripts]
 train = "mjlab_husky.scripts.train:main"
 play = "mjlab_husky.scripts.play:main"
+husky-train = "mjlab_husky.scripts.train:main"
+husky-play = "mjlab_husky.scripts.play:main"
 
 [tool.ruff]
 src = ["src"]  # Helpful for recognizing first-party imports.
@@ -31,3 +34,12 @@ indent-width = 4
 [tool.uv.sources]
 mjlab = { git = "https://github.com/mujocolab/mjlab.git", rev = "13212ad" }
 rsl-rl-lib = { path = "rsl_rl" }
+mujoco = { index = "pypi" }
+warp-lang = { index = "pypi" }
+
+[tool.uv]
+override-dependencies = ["mujoco==3.4.0", "warp-lang==1.11.0", "torch==2.10.0", "torchvision==0.25.0"]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"

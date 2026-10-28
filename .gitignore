@@ -6,7 +6,6 @@ dist/
 wheels/
 *.egg-info
 .python-version
-uv.lock
 
 # Virtual environments
 .venv
@@ -16,3 +15,9 @@ video
 wandb
 logs
 agents
+
+# Local experiment evidence and private runtime data
+buffer/
+*.log
+*.pt
+*.onnx

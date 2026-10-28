@@ -66,16 +66,20 @@ To install this repository, please follow these steps:
    uv pip install -e .
    ```
 
+## Reproduction branch
+
+This branch preserves the released task and learning algorithm. It adds a locked runtime, the missing SciPy dependency, and unique `husky-train` / `husky-play` commands because mjlab installs commands with the same `train` / `play` names. See [the bounded baseline harness](tools/README.md) for finite-value checks, exact update accounting and periodic evaluation.
+
 ## Training Example
 
 ```bash
-uv run train Mjlab-Skater-Flat-Unitree-G1 --env.scene.num-envs 4096
+uv run husky-train Mjlab-Skater-Flat-Unitree-G1 --env.scene.num-envs 4096 --agent.logger tensorboard
 ```
 
 ## Play Examples
 
 ```bash
-uv run play Mjlab-Skater-Flat-Unitree-G1 --checkpoint_file your-ckpt-path
+uv run husky-play Mjlab-Skater-Flat-Unitree-G1 --checkpoint-file your-ckpt-path
 ```
 
 We also provide a lite MuJoCo simulation script for evaluation:
