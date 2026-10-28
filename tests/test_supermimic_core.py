@@ -141,6 +141,88 @@ class WorldTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         torch.testing.assert_close(calls[-1][:, 0], torch.full((2,), 2.0))
 
+    def test_known_reward_normalizes_residual_but_returns_total_for_all_reward_labels(self):
+        known = lambda state, action: -.2 * (action - state[:, :1]).square().sum(-1)
+        model = WorldModel(2, 1, hidden_dims=(8,), known_reward=known)
+        state = torch.tensor([[1., 2.], [2., 3.], [3., 4.]])
+        action = torch.tensor([[0.], [2.], [-1.]])
+        residual = torch.tensor([1., 3., 5.])
+        reward = known(state, action) + residual
+        # Physical terminal and timeout both have invalid reset next states,
+        # but both action costs and residual reward labels remain observable.
+        next_valid = torch.tensor([True, False, False])
+        next_state = torch.where(next_valid[:, None], state, torch.full_like(state, 1e6))
+        model.update_normalization(state, action, next_state, reward, next_valid)
+        self.assertEqual(int(model.input_norm.count), 3)
+        self.assertEqual(int(model.delta_norm.count), 1)
+        self.assertEqual(int(model.reward_norm.count), 3)
+        torch.testing.assert_close(model.reward_norm.mean.float(), residual.mean().reshape(1))
+        torch.testing.assert_close(model.reward_norm.variance.float(), residual.var(unbiased=False).reshape(1))
+        with torch.no_grad():
+            model.reward_head.weight.zero_()
+            model.reward_head.bias.zero_()
+        torch.testing.assert_close(model(state, action).reward, known(state, action) + residual.mean())
+        plain = WorldModel(2, 1, hidden_dims=(8,))
+        self.assertEqual(model.state_dict().keys(), plain.state_dict().keys())
+        self.assertNotIn("reward_representation", plain.training_state_dict())
+        self.assertEqual(model.training_state_dict()["reward_representation"], "action_residual")
+
+    def test_residual_sequence_loss_keeps_failure_and_timeout_rewards(self):
+        known = lambda state, action: -.2 * (action - state[..., :1]).square().sum(-1)
+        model = WorldModel(2, 1, hidden_dims=(8,), known_reward=known)
+        state = torch.tensor([[[1., 0.]], [[2., 0.]], [[3., 0.]]])
+        action = torch.tensor([[[0.]], [[2.]], [[-1.]]])
+        batch = {"state": state, "action": action,
+                 "next_state": torch.tensor([[[1., 0.]], [[1e6, 1e6]], [[-1e6, -1e6]]]),
+                 "reward": known(state, action) + 2.,
+                 "terminated": torch.tensor([[False], [True], [False]]),
+                 "truncated": torch.tensor([[False], [False], [True]]),
+                 "valid": torch.ones(3, 1, dtype=torch.bool),
+                 "next_state_valid": torch.tensor([[True], [False], [False]])}
+        model.update_normalization(state, action, batch["next_state"], batch["reward"], batch["next_state_valid"])
+        with torch.no_grad():
+            model.reward_head.weight.zero_()
+            model.reward_head.bias.zero_()
+        losses = model.sequence_loss(batch)
+        self.assertLess(float(losses["reward_loss"].detach()), 1e-8)
+        self.assertEqual(float(losses["state_loss"].detach()), 0.)
+        batch["reward"][1:] += .01
+        self.assertAlmostEqual(float(model.sequence_loss(batch)["reward_loss"].detach()), 2 / 3, places=4)
+
+    def test_known_reward_frozen_h32_gradients_and_representation_checkpoint_guard(self):
+        torch.manual_seed(3)
+        known = lambda state, action: -.2 * (action - state[..., :1]).square().sum(-1)
+        model = WorldModel(2, 1, hidden_dims=(8,), known_reward=known)
+        with torch.no_grad():
+            model.reward_head.weight.zero_()
+            model.reward_head.bias.zero_()
+        actor = torch.nn.Linear(2, 1)
+        initial = copy.deepcopy(model.state_dict())
+        state, objective = torch.randn(4, 2), 0
+        with frozen_parameters(model):
+            for _ in range(32):
+                prediction = model(state, actor(state))
+                objective += prediction.reward.mean()
+                state = prediction.next_state
+            objective.backward()
+        self.assertGreater(sum(float(parameter.grad.abs().sum()) for parameter in actor.parameters()), 0)
+        self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
+        for key, value in model.state_dict().items():
+            self.assertTrue(torch.equal(value, initial[key]))
+        saved = copy.deepcopy(model.training_state_dict())
+        restored = WorldModel(2, 1, hidden_dims=(8,), known_reward=known)
+        restored.load_training_state_dict(saved)
+        sample = torch.randn(4, 2), torch.randn(4, 1)
+        self.assertTrue(torch.equal(model(*sample).reward, restored(*sample).reward))
+        plain = WorldModel(2, 1, hidden_dims=(8,))
+        before = copy.deepcopy(plain.state_dict())
+        with self.assertRaisesRegex(ValueError, "reward representation differs"):
+            plain.load_training_state_dict(saved)
+        for key, value in plain.state_dict().items():
+            self.assertTrue(torch.equal(value, before[key]))
+        with self.assertRaisesRegex(ValueError, "reward representation differs"):
+            model.load_training_state_dict(plain.training_state_dict())
+
 
 if __name__ == "__main__":
     unittest.main()

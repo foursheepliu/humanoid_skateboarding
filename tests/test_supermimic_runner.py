@@ -21,6 +21,7 @@ except (ModuleNotFoundError, ImportError) as exc:
     raise unittest.SkipTest(f"Runner's bundled RSL-RL dependencies unavailable: {exc}") from exc
 
 from mjlab_husky.supermimic.adapter import StateLayout, roll_history, differentiable_amp_reward
+from mjlab_husky.supermimic.known_rewards import KnownActionRewards
 from mjlab_husky.supermimic.models import frozen_parameters
 
 
@@ -120,6 +121,48 @@ class RichToyAdapter(ToyAdapter):
         return self.layout.pack(fields)
 
 
+class ActionToyEnvironment(ToyEnvironment):
+    """Real task reward contains the exact two known pre-step action costs."""
+    def __init__(self):
+        super().__init__()
+        self.last_action, self.previous_action = torch.zeros(4, 2), torch.zeros(4, 2)
+        self.recorded_rewards, self.recorded_costs = [], []
+
+    def step(self, action):
+        cost = -.1 * .02 * ((action - self.last_action).square().sum(-1)
+                           + (action - 2 * self.last_action + self.previous_action).square().sum(-1))
+        observations, physical_reward, done, extras = super().step(action)
+        self.previous_action = self.last_action.clone()
+        self.last_action = action.detach().clone()
+        self.previous_action[done] = self.last_action[done] = 0
+        reward = physical_reward + cost
+        self.recorded_rewards.append(reward.clone())
+        self.recorded_costs.append(cost.clone())
+        return observations, reward, done, extras
+
+
+class ActionToyAdapter(ToyAdapter):
+    def __init__(self, env):
+        super().__init__()
+        self.env = env
+        self.layout = StateLayout({"actor_obs": 2, "critic_obs": 3,
+                                   "amp_history": (2, 2), "amp_gate": (),
+                                   "action.action": 2, "action.prev_action": 2})
+        self.state_dim = self.layout.dim
+
+    def capture(self, obs, frames):
+        return self.layout.pack(actor_obs=obs["policy"], critic_obs=obs["critic"],
+                                amp_history=frames, amp_gate=torch.ones(len(frames)),
+                                **{"action.action": self.env.last_action,
+                                   "action.prev_action": self.env.previous_action})
+
+    def project_next(self, state, predicted, action):
+        fields = self.layout.unpack(super().project_next(state, predicted, action))
+        fields["action.action"] = action
+        fields["action.prev_action"] = self.layout.get(state, "action.action")
+        return self.layout.pack(fields)
+
+
 class ToyDiscriminator(nn.Linear):
     def __init__(self):
         super().__init__(4, 1)
@@ -183,6 +226,14 @@ class RunnerTests(unittest.TestCase):
     def make_rich_runner(self, config=None, target_dims=(42, 56)):
         return SuperMimicRunner(RichToyEnvironment(target_dims), config or self.config(),
                                 adapter=RichToyAdapter(target_dims), amp=ToyAmp())
+
+    def make_action_runner(self, config=None, *, weight=-.1, step_dt=.02):
+        config = config or self.config(analytic_action_cost=True)
+        env = ActionToyEnvironment()
+        adapter = ActionToyAdapter(env)
+        known = (KnownActionRewards(adapter.layout, weight, weight, step_dt, True)
+                 if config["supermimic"].get("analytic_action_cost", False) else None)
+        return SuperMimicRunner(env, config, adapter=adapter, amp=ToyAmp(), known_reward=known)
 
     def assert_tree_identical(self, left, right):
         if isinstance(left, torch.Tensor):
@@ -543,6 +594,112 @@ class RunnerTests(unittest.TestCase):
                 incompatible.load(valid)
             for name, value in incompatible.policy.state_dict().items():
                 torch.testing.assert_close(value, initial[name])
+
+    def test_analytic_action_cost_keeps_real_total_labels_and_h32_frozen_statistics(self):
+        runner = self.make_action_runner()
+        metrics = runner.collect()
+        data = runner.replay.state_dict()["data"]
+        raw_reward = torch.stack(runner.env.recorded_rewards)
+        known = runner.known_action_reward(data["state"], data["action"])
+        torch.testing.assert_close(data["reward"], raw_reward, rtol=0, atol=0)
+        torch.testing.assert_close(known, torch.stack(runner.env.recorded_costs))
+        self.assertAlmostEqual(metrics["real/task_reward"], float(raw_reward.mean()))
+        self.assertTrue(data["terminated"].any())
+        self.assertTrue(data["truncated"].any())
+        self.assertEqual(int(runner.world_model.reward_norm.count), raw_reward.numel())
+        expected_residual = raw_reward - known
+        torch.testing.assert_close(runner.world_model.reward_norm.mean.float(),
+                                   expected_residual.mean().reshape(1))
+        torch.testing.assert_close(runner.world_model.reward_norm.variance.float(),
+                                   expected_residual.var(unbiased=False).reshape(1), atol=1e-8, rtol=1e-4)
+        runner.fit_world_model()
+        world = copy.deepcopy(runner.world_model.state_dict())
+        disc = copy.deepcopy(runner.amp.discriminator.state_dict())
+        policy_norms = copy.deepcopy((runner.policy.actor_obs_normalizer.state_dict(),
+                                      runner.policy.critic_obs_normalizer.state_dict()))
+        actor = [parameter.detach().clone() for parameter in runner.policy.actor.parameters()]
+        result = runner.update_actor_critic()
+        self.assertGreater(result["actor/gradient_norm"], 0)
+        self.assertTrue(all(math.isfinite(value) for value in result.values()))
+        self.assertTrue(any(not torch.equal(before, after) for before, after in
+                            zip(actor, runner.policy.actor.parameters(), strict=True)))
+        self.assert_tree_identical(world, runner.world_model.state_dict())
+        self.assert_tree_identical(disc, runner.amp.discriminator.state_dict())
+        self.assert_tree_identical(policy_norms, (runner.policy.actor_obs_normalizer.state_dict(),
+                                                  runner.policy.critic_obs_normalizer.state_dict()))
+        self.assertTrue(all(parameter.grad is None for parameter in runner.world_model.parameters()))
+
+    def test_analytic_native_checkpoint_and_metadata_validate_before_any_mutation(self):
+        config = self.config(analytic_action_cost=True, checkpoint_replay=True)
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.make_action_runner(config)
+            runner.learn(2)
+            path = str(Path(directory) / "residual.pt")
+            runner.save(path)
+            checkpoint = torch.load(path, weights_only=False)
+            self.assertEqual(checkpoint["supermimic"]["known_action_reward"], runner.known_action_reward.metadata())
+            native = self.make_action_runner(config)
+            native.load(path)
+            self.assert_tree_identical(native.policy.state_dict(), runner.policy.state_dict())
+            self.assert_tree_identical(native.world_model.training_state_dict(), runner.world_model.training_state_dict())
+            self.assert_tree_identical(native.actor_optimizer.state_dict(), runner.actor_optimizer.state_dict())
+            self.assert_tree_identical(native.critic_optimizer.state_dict(), runner.critic_optimizer.state_dict())
+            self.assert_tree_identical(native.amp.state_dict(), runner.amp.state_dict())
+            self.assertTrue(torch.equal(native._rng.get_state(), runner._rng.get_state()))
+            self.assertEqual(len(native.replay), len(runner.replay))
+            weights_only = self.make_action_runner(config)
+            weights_only.load(path, load_optimizer=False)
+            self.assert_tree_identical(weights_only.world_model.state_dict(), runner.world_model.state_dict())
+            self.assertEqual(len(weights_only.world_model.optimizer.state), 0)
+            for changes in ({"weight": -.2}, {"step_dt": .04}):
+                for load_optimizer in (True, False):
+                    altered = self.make_action_runner(config, **changes)
+                    before = copy.deepcopy((altered.policy.state_dict(), altered.world_model.training_state_dict(),
+                                             altered.amp.state_dict(), altered.actor_optimizer.state_dict(),
+                                             altered._rng.get_state(), altered.replay.state_dict()))
+                    with self.assertRaisesRegex(ValueError, "Known-action reward metadata differs"):
+                        altered.load(path, load_optimizer=load_optimizer)
+                    self.assert_tree_identical(before, (altered.policy.state_dict(), altered.world_model.training_state_dict(),
+                                                        altered.amp.state_dict(), altered.actor_optimizer.state_dict(),
+                                                        altered._rng.get_state(), altered.replay.state_dict()))
+
+    def test_analytic_cross_representation_rejects_even_weights_only_and_legacy_is_total(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plain = self.make_action_runner(self.config(checkpoint_replay=True))
+            plain.learn(1)
+            total_path = str(Path(directory) / "total.pt")
+            plain.save(total_path)
+            legacy = torch.load(total_path, weights_only=False)
+            legacy["supermimic"]["config"].pop("analytic_action_cost")
+            legacy_path = str(Path(directory) / "legacy-total.pt")
+            torch.save(legacy, legacy_path)
+            plain_legacy = self.make_action_runner(self.config(checkpoint_replay=True))
+            plain_legacy.load(legacy_path)
+            self.assert_tree_identical(plain_legacy.world_model.training_state_dict(), plain.world_model.training_state_dict())
+            analytic = self.make_action_runner(self.config(analytic_action_cost=True, checkpoint_replay=True))
+            analytic.learn(1)
+            residual_path = str(Path(directory) / "residual.pt")
+            analytic.save(residual_path)
+            for active, source in ((analytic, legacy_path), (plain, residual_path)):
+                for load_optimizer in (True, False):
+                    before = copy.deepcopy((active.policy.state_dict(), active.world_model.training_state_dict(),
+                                             active.amp.state_dict(), active.actor_optimizer.state_dict(),
+                                             active._rng.get_state(), active.replay.state_dict()))
+                    with self.assertRaisesRegex(ValueError, "across analytic_action_cost reward representations"):
+                        active.load(source, load_optimizer=load_optimizer)
+                    self.assert_tree_identical(before, (active.policy.state_dict(), active.world_model.training_state_dict(),
+                                                        active.amp.state_dict(), active.actor_optimizer.state_dict(),
+                                                        active._rng.get_state(), active.replay.state_dict()))
+            # Explicit bare policy initialization imports no incompatible WM,
+            # normalizer, discriminator, optimizer or replay representation.
+            policy_path = str(Path(directory) / "policy-only.pt")
+            torch.save({"model_state_dict": plain.policy.state_dict()}, policy_path)
+            before = copy.deepcopy((analytic.world_model.training_state_dict(), analytic.amp.state_dict(),
+                                     analytic.replay.state_dict(), analytic._rng.get_state()))
+            analytic.load(policy_path, load_optimizer=False)
+            self.assert_tree_identical(analytic.policy.state_dict(), plain.policy.state_dict())
+            self.assert_tree_identical(before, (analytic.world_model.training_state_dict(), analytic.amp.state_dict(),
+                                                analytic.replay.state_dict(), analytic._rng.get_state()))
 
 
 if __name__ == "__main__":

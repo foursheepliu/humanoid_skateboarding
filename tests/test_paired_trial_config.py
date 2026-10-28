@@ -50,10 +50,11 @@ class PairedTrialConfigTests(unittest.TestCase):
     def test_both_bool_directions_parse_without_scalar_values(self):
         # checkpoint_replay's False default exercises the same generic route as
         # future opt-in bool fields. No field-name allowlist is maintained.
-        settings = replace(SuperMimicConfig(), checkpoint_replay=True,
+        settings = replace(SuperMimicConfig(), checkpoint_replay=True, analytic_action_cost=True,
                            compile_projection=False, detach_critic_transition_targets=False)
         command, parsed = self.parse(PairedTrialConfig(output_dir="/tmp/output", supermimic=settings))
         self.assertIn("--supermimic.checkpoint-replay", command)
+        self.assertIn("--supermimic.analytic-action-cost", command)
         self.assertIn("--supermimic.no-compile-projection", command)
         self.assertIn("--supermimic.no-detach-critic-transition-targets", command)
         self.assertNotIn("True", command)

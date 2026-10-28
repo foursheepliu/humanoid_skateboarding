@@ -48,14 +48,14 @@ def lambda_returns(rewards: Tensor, continuations: Tensor, values: Tensor,
 class SuperMimicRunner:
     """RSL-style runner with independent model, actor, critic and AMP optimizers.
 
-    ``adapter`` and ``amp`` injections allow simulator-free bounded smoke tests.
+    ``adapter``, ``amp`` and ``known_reward`` injections allow simulator-free tests.
     A resume without saved replay retains weights/statistics and recollects the
     configured warmup before the next actor update. Simulator state is never
     restored from a training checkpoint.
     """
 
     def __init__(self, env, train_cfg: dict, log_dir: str | None = None,
-                 device="cpu", *, adapter=None, amp=None):
+                 device="cpu", *, adapter=None, amp=None, known_reward=None):
         self.env, self.cfg = env, train_cfg
         self.device = torch.device(device)
         if int(os.environ.get("WORLD_SIZE", "1")) > 1:
@@ -110,6 +110,16 @@ class SuperMimicRunner:
             raise ValueError("Adapter/action dimensions differ")
         self._critic_transition_target_slices = self._find_critic_transition_target_slices()
         self.critic_transition_target_dim = sum(end - start for start, end in self._critic_transition_target_slices)
+        if known_reward is not None and not self.settings.analytic_action_cost:
+            raise ValueError("An injected known_reward requires analytic_action_cost=True")
+        self.known_action_reward = None
+        if self.settings.analytic_action_cost:
+            if known_reward is None:
+                from .known_rewards import KnownActionRewards
+                known_reward = KnownActionRewards.from_env(env, self.adapter.layout)
+            if not callable(known_reward) or not callable(getattr(known_reward, "metadata", None)):
+                raise ValueError("Runner known_reward must be callable and expose checkpoint metadata()")
+            self.known_action_reward = known_reward
         self._project_next = self.adapter.project_next
         if self.settings.compile_projection and self.device.type == "cuda":
             # Fuse the many small history/kinematics kernels, leaving the
@@ -120,7 +130,8 @@ class SuperMimicRunner:
             self.adapter.state_dim, self.adapter.action_dim,
             hidden_dims=self.settings.model_hidden_dims,
             learning_rate=self.settings.model_learning_rate, device=self.device,
-            gradient_clip=self.settings.max_grad_norm, project_next=self._project_next)
+            gradient_clip=self.settings.max_grad_norm, project_next=self._project_next,
+            known_reward=self.known_action_reward)
         if getattr(self.adapter, "supports_exogenous_projection", False):
             self.world_model.project_training_next = lambda previous, predicted, action, target: (
                 self._project_next(previous, predicted, action,
@@ -144,7 +155,9 @@ class SuperMimicRunner:
             Path(self.log_dir).mkdir(parents=True, exist_ok=True)
             (Path(self.log_dir) / "supermimic_config.json").write_text(
                 json.dumps({"supermimic": asdict(self.settings),
-                            "adapter": self.adapter.metadata()}, indent=2), encoding="utf-8")
+                            "adapter": self.adapter.metadata(),
+                            **({"known_action_reward": self.known_action_reward.metadata()}
+                               if self.known_action_reward is not None else {})}, indent=2), encoding="utf-8")
 
     def _observations(self, observations: Mapping) -> dict[str, Tensor]:
         result = {key: value.to(self.device).detach().clone() for key, value in observations.items()}
@@ -540,6 +553,8 @@ class SuperMimicRunner:
                    "total_real_steps": self.tot_timesteps, "total_time": self.tot_time,
                    "warmup_collections": self._warmup_collections, "rng": self._rng.get_state(),
                    "git_status_repos": self.git_status_repos}
+        if self.known_action_reward is not None:
+            payload["known_action_reward"] = self.known_action_reward.metadata()
         if self.settings.checkpoint_replay:
             payload["replay"] = self.replay.state_dict()
         checkpoint = {"model_state_dict": self.policy.state_dict(),
@@ -574,6 +589,13 @@ class SuperMimicRunner:
             if not required <= set(payload) or payload["version"] != 1:
                 raise ValueError("Unsupported or incomplete SuperMimic checkpoint schema")
             saved_config = SuperMimicConfig.from_checkpoint_dict(payload["config"])
+            if saved_config.analytic_action_cost != self.settings.analytic_action_cost:
+                raise ValueError("Cannot load a world model across analytic_action_cost reward representations, "
+                                 "including with load_optimizer=False. Start fresh or explicitly initialize only "
+                                 "policy weights without importing this world model or its normalizer.")
+            if self.known_action_reward is not None and (
+                    payload.get("known_action_reward") != self.known_action_reward.metadata()):
+                raise ValueError("Known-action reward metadata differs (weights, dt, scaling or action-history schema)")
             if load_optimizer and saved_config.actor_mode != self.settings.actor_mode:
                 description = ("legacy reparameterized checkpoint (no actor_mode)"
                                if "actor_mode" not in payload["config"] else saved_config.actor_mode)
@@ -592,6 +614,9 @@ class SuperMimicRunner:
             if payload["adapter"] != self.adapter.metadata():
                 raise ValueError("Checkpoint training-state layout differs from this environment")
             model = payload["world_model"]
+            expected_reward = "action_residual" if self.settings.analytic_action_cost else "total"
+            if model.get("reward_representation", "total") != expected_reward:
+                raise ValueError("World-model reward representation metadata differs from the configured known reward")
             if (model["state_dim"], model["action_dim"], tuple(model["hidden_dims"])) != (
                     self.adapter.state_dim, self.adapter.action_dim, tuple(self.settings.model_hidden_dims)):
                 raise ValueError("Checkpoint world-model architecture differs")

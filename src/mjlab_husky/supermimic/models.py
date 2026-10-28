@@ -83,7 +83,7 @@ def frozen_parameters(*modules):
 class WorldModel(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, hidden_dims=(512, 512, 512),
                  learning_rate=2e-4, device="cpu", gradient_clip=1.0,
-                 project_next=None):
+                 project_next=None, known_reward=None):
         super().__init__()
         if state_dim < 1 or action_dim < 1 or not hidden_dims or min(hidden_dims) < 1:
             raise ValueError("Model dimensions must be positive")
@@ -92,6 +92,12 @@ class WorldModel(nn.Module):
         # Optional task-owned constraints (e.g. exact observation-history shift).
         # A callable is configuration/code, deliberately not checkpoint state.
         self.project_next = project_next
+        # Optional parameter-free task component A(s,a). The learned scalar
+        # becomes R-A while Prediction.reward remains the total task reward.
+        # The callable is task configuration, not a new model/module parameter.
+        if known_reward is not None and (not callable(known_reward) or isinstance(known_reward, nn.Module)):
+            raise ValueError("known_reward must be a parameter-free callable, not an nn.Module")
+        self.known_reward = known_reward
         # Training may condition known external command/noise updates on their
         # observed samples without teacher-forcing any physical prediction.
         self.project_training_next = None
@@ -122,16 +128,30 @@ class WorldModel(nn.Module):
         if next_state_valid is not None:
             delta = delta[next_state_valid.bool()]
         self.delta_norm.update(delta)
-        self.reward_norm.update(reward.reshape(-1, 1))
+        residual = reward
+        if self.known_reward is not None:
+            known = self.known_reward(state, action)
+            if known.shape != state.shape[:-1]:
+                raise ValueError("Known reward must have the state's leading batch dimensions")
+            residual = reward.reshape(known.shape) - known
+        # Count every real reward, including physical failures and timeouts;
+        # action histories and executed action are available before any reset.
+        self.reward_norm.update(residual.reshape(-1, 1))
 
     def forward(self, state: Tensor, action: Tensor) -> Prediction:
         features = self.input_norm(torch.cat((state, action), -1))
         hidden = self.trunk(features)
-        return Prediction(
+        prediction = Prediction(
             state + self.delta_norm.decode(self.delta_head(hidden)),
             self.reward_norm.decode(self.reward_head(hidden)).squeeze(-1),
             self.termination_head(hidden).squeeze(-1),
         )
+        if self.known_reward is None:
+            return prediction
+        known = self.known_reward(state, action)
+        if known.shape != prediction.reward.shape:
+            raise ValueError("Known reward dimensions differ from the total reward prediction")
+        return Prediction(prediction.next_state, prediction.reward + known, prediction.termination_logit)
 
     def sequence_loss(self, batch: dict[str, Tensor], rollout_steps: int = 8):
         """Autoregressive state/reward/termination loss; never crosses resets.
@@ -161,6 +181,9 @@ class WorldModel(nn.Module):
                               else self.project_next(state, prediction.next_state, action))
             state_error = ((next_state - batch["next_state"][:, t].detach())
                            / self.delta_norm.scale(state)).square().mean(-1)
+            # Replay retains R and forward returns total R, even when the
+            # normalizer/head represent R-A. Exact projected action histories
+            # make this the residual error, scaled by the residual std.
             reward_error = ((prediction.reward - batch["reward"][:, t].detach())
                             / self.reward_norm.scale(prediction.reward)[0]).square()
             termination_error = F.binary_cross_entropy_with_logits(
@@ -192,15 +215,21 @@ class WorldModel(nn.Module):
                 "gradient_norm": float(gradient), "optimizer_updates": self.optimizer_updates}
 
     def training_state_dict(self):
-        return {"model": self.state_dict(), "optimizer": self.optimizer.state_dict(),
+        state = {"model": self.state_dict(), "optimizer": self.optimizer.state_dict(),
                 "optimizer_updates": self.optimizer_updates,
                 "state_dim": self.state_dim, "action_dim": self.action_dim,
                 "hidden_dims": self.hidden_dims}
+        if self.known_reward is not None:
+            state["reward_representation"] = "action_residual"
+        return state
 
     def load_training_state_dict(self, state):
         if (state["state_dim"], state["action_dim"], tuple(state["hidden_dims"])) != (
                 self.state_dim, self.action_dim, self.hidden_dims):
             raise ValueError("World-model checkpoint architecture differs")
+        expected = "action_residual" if self.known_reward is not None else "total"
+        if state.get("reward_representation", "total") != expected:
+            raise ValueError("World-model reward representation differs; scalar-total and residual heads cannot be interchanged")
         self.load_state_dict(state["model"])
         self.optimizer.load_state_dict(state["optimizer"])
         self.optimizer_updates = state["optimizer_updates"]

@@ -196,6 +196,38 @@ survives a horizon, its physical accuracy is reported as unavailable, not zero.
 The probe's `passed` flag checks frozen state and finite predictions; it is not
 an accuracy or policy-success gate.
 
+## Optional exact action-cost component
+
+`--supermimic.analytic-action-cost` in the benchmark/paired CLI enables an
+experimental, parameter-free decomposition of the two original action penalties.
+It defaults to off. For pre-step state `s` and the executed raw action `a`,
+
+```text
+A(s,a) = scale * [w_rate * sum((a - a_previous)^2)
+                 + w_acc * sum((a - 2*a_previous + a_previous_previous)^2)]
+```
+
+Weights and time scaling come from the live original regularization manager.
+The packed pre-step `action.action` is `a_previous`; `action.prev_action` is
+`a_previous_previous`. This uses sums over action coordinates and no division by
+the timestep. The model normalizes/learns `R - A`, while `Prediction.reward`
+always returns `A + learned_residual`, in original total task-reward units.
+Replay, AMP inputs and real reward metrics retain `R`. Failure and timeout reward
+labels all participate; this component does not require a post-reset next state
+or a survival multiplier. Other task rewards and termination predictions remain
+learned. This is an integration option, not a measured learning-speed improvement.
+
+The checkpoint records the reward representation, weights, scaling and history
+schema. Loading a world model across this flag is rejected even with
+`load_optimizer=False`, because total-reward and residual heads have different
+meanings. Use a fresh run for the ablation. A policy-only initialization must
+explicitly omit the old world model and its normalizer.
+
+The paired supervisor forwards and verifies the full requested SuperMimic
+configuration. For example, a separate model-fitting-budget experiment can use
+`--supermimic.model-updates 16`. Keep one factor changed at a time and include
+its extra model fitting, imagination and checkpoint costs in the wall budget.
+
 The source task and bundled RSL-RL retain their existing licenses. Reference
 links describe algorithm provenance; the new backend does not bundle LAFAN
 assets or pretrained checkpoints from the reference project.
