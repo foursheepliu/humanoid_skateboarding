@@ -228,6 +228,38 @@ configuration. For example, a separate model-fitting-budget experiment can use
 `--supermimic.model-updates 16`. Keep one factor changed at a time and include
 its extra model fitting, imagination and checkpoint costs in the wall budget.
 
+## Optional transition-memory projection and WM precision
+
+`--supermimic.project-transition-memory` keeps the four Bezier start-pose
+buffers unchanged between their original phase-entry events. New entry values
+remain learned predictions; no forward kinematics or simulator state is
+teacher-forced. The entry mask uses the projected new contact phase and actual
+previous phase, including the original standing/reset behavior and float32
+boundary arithmetic. It does not change the original real task, the learned
+98 critic targets, or raw simulator qpos/qvel. The option defaults to off.
+
+`--supermimic.model-precision bfloat16` enables autocast only for the world-model
+MLP and its three heads. Master weights, Adam state, decoded state/reward/logit
+outputs and normalization arithmetic stay FP32; the original normalization
+accumulators remain float64. Actor, critic, AMP discriminator and simulation
+precision are unchanged. CUDA BF16 support is checked before use. This allows a
+separate larger-model profile, for example
+`--supermimic.model-hidden-dims 2048 2048 2048`; it does not establish that BF16
+is faster for every width/batch. The default remains `float32`.
+
+Both options passed bounded A5000 integration with a 2048x3 world model and
+H32, including actual phase-entry/hold targets, compiled/eager value and input
+gradient parity, finite updates, precision boundaries and native checkpoint
+restoration. That small integration check is not a training-quality benchmark.
+The default off/FP32 path was checked against the earlier implementation with
+identical seeded tensors and optimizer/RNG states.
+
+Missing checkpoint flags are interpreted as off/FP32. A full optimizer resume
+across precision modes is rejected; explicit weights-only loading can reuse the
+same FP32 master-parameter format. A world model cannot be loaded across
+transition-memory projection modes, including weights-only loading. Use fresh
+runs when comparing these profiles and include compilation/startup in the budget.
+
 The source task and bundled RSL-RL retain their existing licenses. Reference
 links describe algorithm provenance; the new backend does not bundle LAFAN
 assets or pretrained checkpoints from the reference project.

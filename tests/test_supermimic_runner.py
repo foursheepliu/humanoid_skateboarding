@@ -702,5 +702,154 @@ class RunnerTests(unittest.TestCase):
                                                 analytic.replay.state_dict(), analytic._rng.get_state()))
 
 
+    def test_transition_memory_plumbing_and_checkpoint_modes_reject_before_mutation(self):
+        from unittest.mock import patch
+
+        class ModeAdapter(ToyAdapter):
+            def __init__(self, mode):
+                super().__init__()
+                self.project_transition_memory = mode
+
+            def metadata(self):
+                metadata = super().metadata()
+                if self.project_transition_memory:
+                    metadata["fixture_transition_memory_mode"] = True
+                return metadata
+
+        def make(mode):
+            return SuperMimicRunner(ToyEnvironment(), self.config(
+                checkpoint_replay=True, project_transition_memory=mode),
+                adapter=ModeAdapter(mode), amp=ToyAmp())
+
+        def snapshot(runner):
+            return copy.deepcopy((runner.policy.state_dict(), runner.world_model.training_state_dict(),
+                runner.amp.state_dict(), runner.actor_optimizer.state_dict(), runner.critic_optimizer.state_dict(),
+                runner.replay.state_dict(), runner._rng.get_state(), runner.current_learning_iteration,
+                runner.tot_timesteps, runner.tot_time))
+
+        # The actual production constructor receives the flag; injected fixtures
+        # must explicitly expose a matching mode rather than silently bypass it.
+        with patch("mjlab_husky.supermimic.runner.SkateWorldModelAdapter",
+                   side_effect=lambda _env, _obs, _frames, *, project_transition_memory:
+                       ModeAdapter(project_transition_memory)) as factory:
+            produced = SuperMimicRunner(ToyEnvironment(), self.config(project_transition_memory=True), amp=ToyAmp())
+            self.assertTrue(produced.adapter.project_transition_memory)
+            self.assertIs(factory.call_args.kwargs["project_transition_memory"], True)
+        with self.assertRaisesRegex(ValueError, "Injected adapter project_transition_memory"):
+            SuperMimicRunner(ToyEnvironment(), self.config(project_transition_memory=True),
+                            adapter=ToyAdapter(), amp=ToyAmp())
+
+        with tempfile.TemporaryDirectory() as directory:
+            plain, active = make(False), make(True)
+            plain.learn(1)
+            active.learn(1)
+            paths = {False: str(Path(directory)/"plain.pt"), True: str(Path(directory)/"projected.pt")}
+            plain.save(paths[False])
+            active.save(paths[True])
+            for mode, runner in ((False, plain), (True, active)):
+                restored = make(mode)
+                restored.load(paths[mode])
+                self.assert_tree_identical(restored.policy.state_dict(), runner.policy.state_dict())
+                self.assert_tree_identical(restored.world_model.training_state_dict(), runner.world_model.training_state_dict())
+                for optimizer in (True, False):
+                    before = snapshot(runner)
+                    with self.assertRaisesRegex(ValueError, "across project_transition_memory projection modes"):
+                        runner.load(paths[not mode], load_optimizer=optimizer)
+                    self.assert_tree_identical(before, snapshot(runner))
+            # A genuinely old checkpoint has no config flag and retains exactly
+            # the original adapter metadata; both are interpreted as False.
+            legacy = torch.load(paths[False], weights_only=False)
+            legacy["supermimic"]["config"].pop("project_transition_memory")
+            legacy_path = str(Path(directory)/"legacy.pt")
+            torch.save(legacy, legacy_path)
+            old = make(False)
+            old.load(legacy_path)
+            self.assertFalse(old.settings.project_transition_memory)
+            self.assert_tree_identical(old.world_model.training_state_dict(), plain.world_model.training_state_dict())
+            for optimizer in (True, False):
+                before = snapshot(active)
+                with self.assertRaisesRegex(ValueError, "across project_transition_memory projection modes"):
+                    active.load(legacy_path, load_optimizer=optimizer)
+                self.assert_tree_identical(before, snapshot(active))
+            # Matching flags cannot bypass an incompatible adapter projection
+            # identity, even when only weights are requested.
+            tampered = torch.load(paths[True], weights_only=False)
+            tampered["supermimic"]["adapter"] = plain.adapter.metadata()
+            tampered_path = str(Path(directory)/"wrong-adapter-mode.pt")
+            torch.save(tampered, tampered_path)
+            for optimizer in (True, False):
+                before = snapshot(active)
+                with self.assertRaisesRegex(ValueError, "training-state layout differs"):
+                    active.load(tampered_path, load_optimizer=optimizer)
+                self.assert_tree_identical(before, snapshot(active))
+
+
+    def test_model_precision_plumbing_native_resume_and_explicit_weights_only_change(self):
+        bf_config = self.config(model_precision="bfloat16", checkpoint_replay=True)
+        runner = self.make_runner(bf_config)
+        self.assertEqual(runner.world_model.precision, "bfloat16")
+        other_network_dtypes = []
+        handles = [network.register_forward_hook(
+            lambda _module, _inputs, output: other_network_dtypes.append(output.dtype))
+            for network in (runner.policy.actor, runner.policy.critic, runner.amp.discriminator)]
+        try:
+            runner.learn(1)
+        finally:
+            for handle in handles:
+                handle.remove()
+        self.assertGreater(len(other_network_dtypes), 32)
+        self.assertEqual(set(other_network_dtypes), {torch.float32})
+        self.assertTrue(all(parameter.dtype == torch.float32 for parameter in runner.world_model.parameters()))
+        self.assertTrue(math.isfinite(runner.last_metrics["actor/gradient_norm"]))
+        with tempfile.TemporaryDirectory() as directory:
+            bf_path = str(Path(directory) / "bf16.pt")
+            runner.save(bf_path)
+            checkpoint = torch.load(bf_path, weights_only=False)
+            native = self.make_runner(bf_config)
+            native.load(bf_path)
+            self.assert_tree_identical(native.world_model.training_state_dict(), runner.world_model.training_state_dict())
+            self.assert_tree_identical(native.actor_optimizer.state_dict(), runner.actor_optimizer.state_dict())
+            self.assert_tree_identical(native.critic_optimizer.state_dict(), runner.critic_optimizer.state_dict())
+            self.assertTrue(torch.equal(native._rng.get_state(), runner._rng.get_state()))
+            plain = self.make_runner(self.config(checkpoint_replay=True))
+            before = copy.deepcopy((plain.policy.state_dict(), plain.world_model.training_state_dict(),
+                                     plain.actor_optimizer.state_dict(), plain.amp.state_dict(), plain._rng.get_state()))
+            with self.assertRaisesRegex(ValueError, "across model_precision modes"):
+                plain.load(bf_path)
+            self.assert_tree_identical(before, (plain.policy.state_dict(), plain.world_model.training_state_dict(),
+                                                plain.actor_optimizer.state_dict(), plain.amp.state_dict(), plain._rng.get_state()))
+            plain.load(bf_path, load_optimizer=False)
+            self.assertEqual(plain.world_model.precision, "float32")
+            self.assert_tree_identical(plain.world_model.state_dict(), runner.world_model.state_dict())
+            self.assertEqual(len(plain.world_model.optimizer.state), 0)
+            legacy_source = self.make_runner(self.config(checkpoint_replay=True))
+            legacy_source.learn(1)
+            fp_path = str(Path(directory) / "fp32.pt")
+            legacy_source.save(fp_path)
+            legacy = torch.load(fp_path, weights_only=False)
+            legacy["supermimic"]["config"].pop("model_precision")
+            self.assertNotIn("precision", legacy["supermimic"]["world_model"])
+            legacy_path = str(Path(directory) / "legacy-fp32.pt")
+            torch.save(legacy, legacy_path)
+            # Metadata missing on both config/model means legacy FP32. Network
+            # tensor format is identical; no precision-dependent state keys.
+            legacy_plain = self.make_runner(self.config(checkpoint_replay=True))
+            legacy_plain.load(legacy_path)
+            self.assertEqual(legacy_plain.world_model.precision, "float32")
+            with self.assertRaisesRegex(ValueError, "across model_precision modes"):
+                native.load(legacy_path)
+            native.load(legacy_path, load_optimizer=False)
+            malformed = copy.deepcopy(checkpoint)
+            malformed["supermimic"]["world_model"]["precision"] = "float32"
+            malformed_path = str(Path(directory) / "bad-precision-metadata.pt")
+            torch.save(malformed, malformed_path)
+            before = copy.deepcopy(native.policy.state_dict())
+            with self.assertRaisesRegex(ValueError, "precision metadata differs"):
+                native.load(malformed_path, load_optimizer=False)
+            self.assert_tree_identical(before, native.policy.state_dict())
+        with self.assertRaisesRegex(ValueError, "model_precision must"):
+            self.make_runner(self.config(model_precision="float16"))
+
+
 if __name__ == "__main__":
     unittest.main()

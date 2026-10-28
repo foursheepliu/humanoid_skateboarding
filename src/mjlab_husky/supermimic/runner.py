@@ -105,7 +105,11 @@ class SuperMimicRunner:
         self.amp_obs_frames = torch.zeros((self.num_envs, self.amp_num_frames,
                                           self.amp_observation_dim), device=self.device)
         self.amp_obs_frames = roll_history(self.amp_obs_frames, current_amp)
-        self.adapter = adapter or SkateWorldModelAdapter(env, self._obs, self.amp_obs_frames)
+        self.adapter = adapter or SkateWorldModelAdapter(
+            env, self._obs, self.amp_obs_frames,
+            project_transition_memory=self.settings.project_transition_memory)
+        if bool(getattr(self.adapter, "project_transition_memory", False)) != self.settings.project_transition_memory:
+            raise ValueError("Injected adapter project_transition_memory mode differs from the configuration")
         if self.adapter.action_dim != env.num_actions:
             raise ValueError("Adapter/action dimensions differ")
         self._critic_transition_target_slices = self._find_critic_transition_target_slices()
@@ -131,7 +135,7 @@ class SuperMimicRunner:
             hidden_dims=self.settings.model_hidden_dims,
             learning_rate=self.settings.model_learning_rate, device=self.device,
             gradient_clip=self.settings.max_grad_norm, project_next=self._project_next,
-            known_reward=self.known_action_reward)
+            known_reward=self.known_action_reward, precision=self.settings.model_precision)
         if getattr(self.adapter, "supports_exogenous_projection", False):
             self.world_model.project_training_next = lambda previous, predicted, action, target: (
                 self._project_next(previous, predicted, action,
@@ -589,6 +593,10 @@ class SuperMimicRunner:
             if not required <= set(payload) or payload["version"] != 1:
                 raise ValueError("Unsupported or incomplete SuperMimic checkpoint schema")
             saved_config = SuperMimicConfig.from_checkpoint_dict(payload["config"])
+            if saved_config.project_transition_memory != self.settings.project_transition_memory:
+                raise ValueError("Cannot load a world model across project_transition_memory projection modes, "
+                                 "including with load_optimizer=False. Initialize only policy weights "
+                                 "without importing an incompatible world model.")
             if saved_config.analytic_action_cost != self.settings.analytic_action_cost:
                 raise ValueError("Cannot load a world model across analytic_action_cost reward representations, "
                                  "including with load_optimizer=False. Start fresh or explicitly initialize only "
@@ -596,6 +604,10 @@ class SuperMimicRunner:
             if self.known_action_reward is not None and (
                     payload.get("known_action_reward") != self.known_action_reward.metadata()):
                 raise ValueError("Known-action reward metadata differs (weights, dt, scaling or action-history schema)")
+            if load_optimizer and saved_config.model_precision != self.settings.model_precision:
+                raise ValueError("Cannot resume world-model optimizer across model_precision modes. "
+                                 "Use load_optimizer=False explicitly to initialize FP32 master weights "
+                                 "without importing optimizer state.")
             if load_optimizer and saved_config.actor_mode != self.settings.actor_mode:
                 description = ("legacy reparameterized checkpoint (no actor_mode)"
                                if "actor_mode" not in payload["config"] else saved_config.actor_mode)
@@ -614,6 +626,8 @@ class SuperMimicRunner:
             if payload["adapter"] != self.adapter.metadata():
                 raise ValueError("Checkpoint training-state layout differs from this environment")
             model = payload["world_model"]
+            if model.get("precision", "float32") != saved_config.model_precision:
+                raise ValueError("World-model precision metadata differs from the saved configuration")
             expected_reward = "action_residual" if self.settings.analytic_action_cost else "total"
             if model.get("reward_representation", "total") != expected_reward:
                 raise ValueError("World-model reward representation metadata differs from the configured known reward")

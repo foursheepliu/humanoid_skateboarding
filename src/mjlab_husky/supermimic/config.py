@@ -12,6 +12,7 @@ class SuperMimicConfig:
     actor_mode: Literal["deterministic", "reparameterized"] = "deterministic"
     real_exploration_std: float = 0.1
     detach_critic_transition_targets: bool = True
+    project_transition_memory: bool = False
     analytic_action_cost: bool = False
     real_steps: int = 5
     horizon: int = 32
@@ -26,6 +27,7 @@ class SuperMimicConfig:
     amp_updates: int = 20
     amp_batch_size: int = 256
     model_hidden_dims: tuple[int, ...] = (512, 512, 512)
+    model_precision: Literal["float32", "bfloat16"] = "float32"
     model_learning_rate: float = 2e-4
     actor_learning_rate: float = 2e-4
     critic_learning_rate: float = 2e-4
@@ -45,8 +47,12 @@ class SuperMimicConfig:
             raise ValueError("actor_mode must be deterministic or reparameterized")
         if not isinstance(self.detach_critic_transition_targets, bool):
             raise ValueError("detach_critic_transition_targets must be a boolean")
+        if type(self.project_transition_memory) is not bool:
+            raise ValueError("project_transition_memory must be a boolean")
         if not isinstance(self.analytic_action_cost, bool):
             raise ValueError("analytic_action_cost must be a boolean")
+        if self.model_precision not in ("float32", "bfloat16"):
+            raise ValueError("model_precision must be float32 or bfloat16")
         if not math.isfinite(self.real_exploration_std) or self.real_exploration_std < 0:
             raise ValueError("real_exploration_std must be finite and nonnegative")
         positive = ("real_steps", "horizon", "model_sequence_length", "model_batch_size",
@@ -90,7 +96,9 @@ class SuperMimicConfig:
         values = dict(values)
         values.setdefault("actor_mode", "reparameterized")
         values.setdefault("detach_critic_transition_targets", False)
+        values.setdefault("project_transition_memory", False)
         values.setdefault("analytic_action_cost", False)
+        values.setdefault("model_precision", "float32")
         return cls.from_dict(values)
 
 

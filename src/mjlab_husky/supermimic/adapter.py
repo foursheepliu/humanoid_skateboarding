@@ -220,7 +220,11 @@ class SkateWorldModelAdapter:
     supports_exogenous_projection = True
     command_noise_dim = 6
 
-    def __init__(self, env: Any, observations: Mapping[str, Tensor], amp_frames: Tensor):
+    def __init__(self, env: Any, observations: Mapping[str, Tensor], amp_frames: Tensor, *,
+                 project_transition_memory: bool = False):
+        if type(project_transition_memory) is not bool:
+            raise ValueError("project_transition_memory must be a boolean")
+        self.project_transition_memory = project_transition_memory
         self.env = getattr(env, "unwrapped", env)
         self.num_envs = int(self.env.num_envs)
         self.step_dt = float(self.env.step_dt)
@@ -233,6 +237,22 @@ class SkateWorldModelAdapter:
         fields = self._fields(observations, amp_frames)
         self.layout = StateLayout.from_tensors(fields)
         self.state_dim = self.layout.dim
+        self._transition_memory_fields = (
+            ("bezier.push2steer_start_pos_b", 2, 3),
+            ("bezier.push2steer_start_quat_b", 2, 4),
+            ("bezier.steer2push_start_pos_b", 3, 3),
+            ("bezier.steer2push_start_quat_b", 3, 4),
+        )
+        if self.project_transition_memory:
+            body_counts = set()
+            for name, _phase_column, width in self._transition_memory_fields:
+                shape = self.layout.shapes.get(name)
+                if shape is None or len(shape) != 2 or shape[0] < 1 or shape[1] != width:
+                    raise ValueError(f"Transition memory requires {name} with shape (num_bodies, {width})")
+                body_counts.add(shape[0])
+            if (len(body_counts) != 1 or self.layout.shapes.get("contact_phase") != (4,)
+                    or self.layout.shapes.get("phase_length_buf") != ()):
+                raise ValueError("Transition memory requires matching body counts and original phase buffers")
         self.actor_dim = observations[self.actor_group].shape[-1]
         self.critic_dim = observations[self.critic_group].shape[-1]
         action_dim = getattr(env, "num_actions", None)
@@ -606,6 +626,16 @@ class SkateWorldModelAdapter:
                 result["last_contact_phase"] = previous["contact_phase"]
         else:
             result["amp_gate"] = result["amp_gate"].clamp(0, 1)
+        if self.project_transition_memory:
+            # Original _resample_contact_phases writes each board-frame anchor
+            # only on entry, before rewards/reset/command resampling. The entry
+            # value stays learned: root/joint state is insufficient for exact FK.
+            # Use actual old contact flags, including the task's stale flags
+            # after reset, rather than reconstructing them from the old clock.
+            for name, phase_column, _width in self._transition_memory_fields:
+                entry = ((result["contact_phase"][..., phase_column] > .5)
+                         & (previous["contact_phase"][..., phase_column] < .5))
+                result[name] = torch.where(entry[..., None, None], result[name], previous[name])
         self._project_commands(previous, result, exogenous)
         truth_state = exogenous.get("next_state")
         truth_fields = self.layout.unpack(truth_state.detach()) if truth_state is not None else None
@@ -657,7 +687,7 @@ class SkateWorldModelAdapter:
                                          discriminator, mean, std, **kwargs)
 
     def metadata(self) -> dict[str, Any]:
-        return {**self.layout.metadata(), "version": 2, "actor_group": self.actor_group,
+        metadata = {**self.layout.metadata(), "version": 2, "actor_group": self.actor_group,
                 "critic_group": self.critic_group, "actor_dim": self.actor_dim,
                 "critic_dim": self.critic_dim, "action_dim": self.action_dim,
                 "amp_num_frames": self.amp_num_frames,
@@ -666,6 +696,14 @@ class SkateWorldModelAdapter:
                 "observation_projection": "physical state plus external commands and sensor noise",
                 "history_order": "per-term oldest-to-newest",
                 "terminal_next_state": "post-reset next state; dynamics target must be masked"}
+        # Preserve legacy False metadata exactly; an enabled projection changes
+        # world-model semantics even though packed tensor dimensions stay equal.
+        if self.project_transition_memory:
+            metadata["transition_memory_projection"] = {
+                "version": 1, "mode": "learned on phase entry; otherwise hold previous",
+                "fields": {name: {"entry_phase_column": column} for name, column, _width
+                           in self._transition_memory_fields}}
+        return metadata
 
 
 # Short alias for callers that select the adapter via the training backend.

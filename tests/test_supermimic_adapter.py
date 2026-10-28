@@ -349,5 +349,162 @@ class AmpRewardTests(unittest.TestCase):
         torch.testing.assert_close(lerp, task_reward + gate * (.7 * task_reward + .3 * style - task_reward))
 
 
+class TransitionMemoryTests(unittest.TestCase):
+    @staticmethod
+    def task(num_bodies=30):
+        env, obs, amp = _full_task()
+        env.body_bezier_buffers = {
+            f"{direction}_start_{kind}_b": torch.randn(2, num_bodies, width)
+            for direction in ("push2steer", "steer2push")
+            for kind, width in (("pos", 3), ("quat", 4))}
+        return env, obs, amp
+
+    @staticmethod
+    def original_contacts(counter):
+        # Use the original float32 arithmetic/comparisons, including roundoff
+        # at 120 ticks (.399999976 < float32 .4); do not invent integer gates.
+        phase = torch.remainder(counter * .02 / 6., 1.)
+        return torch.stack(((phase >= 0.) & (phase < .4),
+                            (phase >= .5) & (phase < .95),
+                            (phase >= .4) & (phase < .5),
+                            (phase >= .95) & (phase <= 1.)), -1).float()
+
+    def test_opt_in_schema_and_false_metadata_forward_and_gradients(self):
+        env, obs, amp = self.task()
+        default = SkateWorldModelAdapter(env, obs, amp)
+        disabled = SkateWorldModelAdapter(env, obs, amp, project_transition_memory=False)
+        active = SkateWorldModelAdapter(env, obs, amp, project_transition_memory=True)
+        self.assertEqual(default.metadata(), disabled.metadata())
+        self.assertNotIn("transition_memory_projection", default.metadata())
+        self.assertEqual(active.metadata()["transition_memory_projection"]["version"], 1)
+        state = default.capture(obs, amp).requires_grad_()
+        predicted = torch.randn_like(state, requires_grad=True)
+        action = torch.randn(2, 23, requires_grad=True)
+        exogenous = {"next_state": state.detach()}
+        first = default.project_next(state, predicted, action, exogenous=exogenous)
+        second = disabled.project_next(state, predicted, action, exogenous=exogenous)
+        self.assertTrue(torch.equal(first, second))
+        cotangent = torch.randn_like(first)
+        g1 = torch.autograd.grad((first*cotangent).sum(), (state, predicted, action), retain_graph=True)
+        g2 = torch.autograd.grad((second*cotangent).sum(), (state, predicted, action))
+        for left, right in zip(g1, g2):
+            self.assertTrue(torch.equal(left, right))
+        for invalid in (1, "true", None):
+            with self.assertRaisesRegex(ValueError, "must be a boolean"):
+                SkateWorldModelAdapter(env, obs, amp, project_transition_memory=invalid)
+        env.body_bezier_buffers["push2steer_start_pos_b"] = torch.zeros(2, 29, 3)
+        with self.assertRaisesRegex(ValueError, "matching body counts"):
+            SkateWorldModelAdapter(env, obs, amp, project_transition_memory=True)
+        del env.body_bezier_buffers["push2steer_start_pos_b"]
+        with self.assertRaisesRegex(ValueError, "requires bezier.push2steer_start_pos_b"):
+            SkateWorldModelAdapter(env, obs, amp, project_transition_memory=True)
+
+    def test_phase_edges_hold_or_enter_only_the_correct_pair_and_preserve_other_fields(self):
+        for old_counter in (119, 120, 121, 149, 150, 200, 284, 285, 299, 300):
+            with self.subTest(old_counter=old_counter):
+                env, obs, amp = self.task()
+                env.phase_length_buf[:] = old_counter
+                env.command_manager._terms["skate"].command_b[:, 0] = 1.
+                env.contact_phase[:] = self.original_contacts(torch.full((2,), float(old_counter)))
+                adapter = SkateWorldModelAdapter(env, obs, amp, project_transition_memory=True)
+                plain = SkateWorldModelAdapter(env, obs, amp)
+                state = adapter.capture(obs, amp)
+                fields = adapter.layout.unpack(torch.randn_like(state))
+                for number, (name, _column, _width) in enumerate(adapter._transition_memory_fields):
+                    fields[name] = torch.full_like(fields[name], -100-number)
+                predicted = adapter.layout.pack(fields)
+                action = torch.zeros(2, 23)
+                actual = adapter.layout.unpack(adapter.project_next(state, predicted, action,
+                                                exogenous={"next_state": state}))
+                baseline = plain.layout.unpack(plain.project_next(state, predicted, action,
+                                                exogenous={"next_state": state}))
+                expected_phase = self.original_contacts(torch.full((2,), float(old_counter+1)))
+                torch.testing.assert_close(actual["contact_phase"], expected_phase, rtol=0, atol=0)
+                memories = {name for name, _column, _width in adapter._transition_memory_fields}
+                for name in actual:
+                    if name not in memories:
+                        self.assertTrue(torch.equal(actual[name], baseline[name]), name)
+                for name, column, _width in adapter._transition_memory_fields:
+                    entry = (expected_phase[:, column] > .5) & (env.contact_phase[:, column] < .5)
+                    expected = torch.where(entry[:, None, None], fields[name], adapter.layout.get(state, name))
+                    torch.testing.assert_close(actual[name], expected, rtol=0, atol=0)
+
+    def test_entry_gradients_use_prediction_and_hold_keeps_previous_graph(self):
+        env, obs, amp = self.task()
+        env.phase_length_buf[:] = torch.tensor([120, 121])
+        env.command_manager._terms["skate"].command_b[:, 0] = 1.
+        env.contact_phase[:] = torch.tensor([[1., 0., 0., 0.], [0., 0., 1., 0.]])
+        adapter = SkateWorldModelAdapter(env, obs, amp, project_transition_memory=True)
+        state = adapter.capture(obs, amp).requires_grad_()
+        predicted = torch.randn_like(state, requires_grad=True)
+        action = torch.zeros(2, 23)
+        result = adapter.project_next(state, predicted, action, exogenous={"next_state": state.detach()})
+        # A further non-entry imagined step must retain the first entry's graph.
+        next_fields = adapter.layout.unpack(result.detach())
+        next_fields["phase_length_buf"] = torch.tensor([121., 122.])
+        next_prediction = adapter.layout.pack(next_fields)
+        result = adapter.project_next(result, next_prediction, action,
+                                      exogenous={"next_state": result.detach()})
+        loss = sum(adapter.layout.get(result, name).sum()
+                   for name, _column, _width in adapter._transition_memory_fields)
+        previous_grad, prediction_grad = torch.autograd.grad(loss, (state, predicted))
+        for name, column, _width in adapter._transition_memory_fields:
+            expected_prediction = torch.zeros_like(adapter.layout.get(state, name))
+            if column == 2:
+                expected_prediction[0] = 1.
+            torch.testing.assert_close(adapter.layout.get(prediction_grad, name), expected_prediction, rtol=0, atol=0)
+            torch.testing.assert_close(adapter.layout.get(previous_grad, name), 1-expected_prediction, rtol=0, atol=0)
+
+    def test_standing_uses_previous_command_and_reset_like_stale_contact_is_safe(self):
+        for old_counter, old_vx, next_vx, stale_reset in (
+                (120, 1., 0., False), (120, 0., 1., False),
+                (0, 1., 1., True), (150, 0., 1., False), (149, -.2, 1., False)):
+            with self.subTest(counter=old_counter, old_vx=old_vx, reset=stale_reset):
+                env, obs, amp = self.task()
+                env.phase_length_buf[:] = old_counter
+                env.command_manager._terms["skate"].command_b[:, 0] = old_vx
+                env.contact_phase[:] = torch.tensor([[0., 0., 1., 0.]]) if stale_reset else 0.
+                if stale_reset:
+                    for memory in env.body_bezier_buffers.values():
+                        memory.zero_()
+                adapter = SkateWorldModelAdapter(env, obs, amp, project_transition_memory=True)
+                state = adapter.capture(obs, amp)
+                truth = adapter.layout.unpack(state.clone())
+                truth["command.skate.command_b"][:, 0] = next_vx
+                result = adapter.project_next(state, torch.randn_like(state), torch.zeros(2, 23),
+                                             exogenous={"next_state": adapter.layout.pack(truth)})
+                new_contact = adapter.layout.get(result, "contact_phase")
+                self.assertEqual(bool(new_contact.any()), old_vx >= .1)
+                for name, column, _width in adapter._transition_memory_fields:
+                    entry = (new_contact[:, column] > .5) & (env.contact_phase[:, column] < .5)
+                    if not entry.any():
+                        torch.testing.assert_close(adapter.layout.get(result, name), adapter.layout.get(state, name), rtol=0, atol=0)
+                if old_vx < .1 and old_counter in (0, 150):
+                    self.assertEqual(float(adapter.layout.get(result, "phase_length_buf").abs().sum()), 0.)
+
+    def test_real_reset_next_memory_is_masked_and_windows_do_not_cross_reset(self):
+        from mjlab_husky.supermimic.replay import ReplayBuffer
+        env, obs, amp = self.task()
+        adapter = SkateWorldModelAdapter(env, obs, amp, project_transition_memory=True)
+        state = adapter.capture(obs, amp)
+        reset = adapter.layout.unpack(state.clone())
+        reset["phase_length_buf"].zero_()
+        for name, _column, _width in adapter._transition_memory_fields:
+            reset[name].zero_()
+        reset = adapter.layout.pack(reset)
+        replay = ReplayBuffer(4, 2, adapter.state_dim, adapter.action_dim, seed=12)
+        for step in range(3):
+            terminated = torch.tensor([step == 0, False])
+            truncated = torch.tensor([False, step == 1])
+            replay.append(state if step == 0 else reset, torch.zeros(2, 23), reset,
+                          torch.ones(2), terminated, truncated)
+        batch = replay.sample_sequences(128, 3)
+        boundary = batch["terminated"] | batch["truncated"]
+        self.assertTrue(boundary[batch["valid"]].any())
+        self.assertFalse(batch["next_state_valid"][boundary].any())
+        for step in (1, 2):
+            self.assertFalse((batch["valid"][:, step] & boundary[:, step-1]).any())
+
+
 if __name__ == "__main__":
     unittest.main()

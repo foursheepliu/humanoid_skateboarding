@@ -2,6 +2,7 @@
 
 import copy
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -222,6 +223,154 @@ class WorldTests(unittest.TestCase):
             self.assertTrue(torch.equal(value, before[key]))
         with self.assertRaisesRegex(ValueError, "reward representation differs"):
             model.load_training_state_dict(plain.training_state_dict())
+
+    def test_bfloat16_only_autocasts_network_and_returns_fp32_with_fp32_master_weights(self):
+        observed_known = []
+        def known(state, action):
+            observed_known.append((state.dtype, action.dtype))
+            return -.2 * action.square().sum(-1)
+        model = WorldModel(2, 2, hidden_dims=(16,), known_reward=known, precision="bfloat16")
+        batch = self.toy_batch(batch_size=8, horizon=3)
+        model.update_normalization(batch["state"], batch["action"], batch["next_state"], batch["reward"])
+        observed_heads, observed_norms = [], []
+        handles = [head.register_forward_hook(lambda _module, _inputs, output: observed_heads.append(output.dtype))
+                   for head in (model.delta_head, model.reward_head, model.termination_head)]
+        handles.append(model.input_norm.register_forward_hook(
+            lambda _module, _inputs, output: observed_norms.append(output.dtype)))
+        state = torch.randn(4, 2, requires_grad=True)
+        action = torch.randn(4, 2, requires_grad=True)
+        observed_known.clear()
+        try:
+            # An enclosing AMP context must not lower normalization, analytic
+            # rewards, physical-state arithmetic or decoded head outputs.
+            with patch.object(model.delta_norm, "decode", wraps=model.delta_norm.decode) as delta_decode:
+                with patch.object(model.reward_norm, "decode", wraps=model.reward_norm.decode) as reward_decode:
+                    with torch.autocast("cpu", dtype=torch.bfloat16):
+                        prediction = model(state, action)
+                    self.assertEqual(delta_decode.call_args.args[0].dtype, torch.float32)
+                    self.assertEqual(reward_decode.call_args.args[0].dtype, torch.float32)
+        finally:
+            for handle in handles:
+                handle.remove()
+        self.assertEqual(observed_heads, [torch.bfloat16] * 3)
+        self.assertEqual(observed_norms, [torch.float32])
+        self.assertEqual(observed_known, [(torch.float32, torch.float32)])
+        self.assertTrue(all(value.dtype == torch.float32 for value in prediction))
+        self.assertEqual(prediction.continuation.dtype, torch.float32)
+        (prediction.reward.mean() + prediction.next_state.square().mean()
+         + prediction.termination_logit.mean()).backward()
+        for value in (state.grad, action.grad):
+            self.assertEqual(value.dtype, torch.float32)
+            self.assertTrue(torch.isfinite(value).all())
+        self.assertTrue(all(parameter.dtype == torch.float32 for parameter in model.parameters()))
+        self.assertTrue(all(parameter.grad.dtype == torch.float32 and torch.isfinite(parameter.grad).all()
+                            for parameter in model.parameters() if parameter.grad is not None))
+        # Existing high-precision statistical accumulators retain their schema.
+        self.assertEqual(model.reward_norm.mean.dtype, torch.float64)
+        self.assertEqual(model.reward_norm.count.dtype, torch.int64)
+        lower_input = model(state.detach().bfloat16(), action.detach().bfloat16())
+        self.assertTrue(all(value.dtype == torch.float32 for value in lower_input))
+        lower_batch = {name: value.bfloat16() if value.is_floating_point() else value
+                       for name, value in batch.items()}
+        losses = model.sequence_loss(lower_batch)
+        self.assertTrue(all(value.dtype == torch.float32 for value in losses.values()))
+        with self.assertRaisesRegex(ValueError, "precision must be float32 or bfloat16"):
+            WorldModel(2, 2, hidden_dims=(8,), precision="float16")
+
+    def test_cpu_bfloat16_fit_reduces_loss_without_updating_stats_or_lowering_adam(self):
+        torch.manual_seed(3)
+        model = WorldModel(2, 2, hidden_dims=(32, 32), learning_rate=.01, precision="bfloat16")
+        batch = self.toy_batch()
+        model.update_normalization(batch["state"], batch["action"], batch["next_state"], batch["reward"])
+        norms = {name: copy.deepcopy(getattr(model, name).state_dict())
+                 for name in ("input_norm", "delta_norm", "reward_norm")}
+        initial = float(model.sequence_loss(batch)["loss"].detach())
+        for _ in range(120):
+            metrics = model.fit(batch)
+        final = float(model.sequence_loss(batch)["loss"].detach())
+        self.assertLess(final, initial * .4)
+        self.assertTrue(all(torch.isfinite(torch.tensor(value)) for value in metrics.values()))
+        for state in model.optimizer.state.values():
+            for name in ("exp_avg", "exp_avg_sq"):
+                self.assertEqual(state[name].dtype, torch.float32)
+                self.assertTrue(torch.isfinite(state[name]).all())
+        for name, before in norms.items():
+            for field, value in getattr(model, name).state_dict().items():
+                self.assertTrue(torch.equal(before[field], value))
+
+    def test_cpu_bfloat16_frozen_h32_preserves_fp32_actor_gradients_and_statistics(self):
+        torch.manual_seed(7)
+        model = WorldModel(2, 2, hidden_dims=(16, 16), precision="bfloat16")
+        torch.nn.init.normal_(model.delta_head.weight, std=.02)
+        actor = torch.nn.Linear(2, 2)
+        actor_dtypes = []
+        handle = actor.register_forward_hook(lambda _module, _inputs, output: actor_dtypes.append(output.dtype))
+        before = copy.deepcopy(model.state_dict())
+        state, objective = torch.randn(8, 2), 0
+        try:
+            with frozen_parameters(model):
+                for _ in range(32):
+                    prediction = model(state, torch.tanh(actor(state)))
+                    self.assertTrue(all(value.dtype == torch.float32 for value in prediction))
+                    objective += prediction.reward.mean()
+                    state = prediction.next_state
+                loss = objective + state.square().mean()
+                self.assertEqual(loss.dtype, torch.float32)
+                loss.backward()
+        finally:
+            handle.remove()
+        self.assertEqual(actor_dtypes, [torch.float32] * 32)
+        self.assertGreater(sum(float(parameter.grad.abs().sum()) for parameter in actor.parameters()), 0)
+        self.assertTrue(all(parameter.grad.dtype == torch.float32 and torch.isfinite(parameter.grad).all()
+                            for parameter in actor.parameters()))
+        self.assertTrue(all(parameter.grad is None and parameter.requires_grad for parameter in model.parameters()))
+        for name, value in model.state_dict().items():
+            self.assertTrue(torch.equal(before[name], value))
+
+    def test_precision_checkpoint_native_legacy_guard_before_mutation_and_weights_only(self):
+        def same(first, second):
+            if isinstance(first, torch.Tensor):
+                self.assertTrue(torch.equal(first, second))
+            elif isinstance(first, dict):
+                self.assertEqual(first.keys(), second.keys())
+                for key in first:
+                    same(first[key], second[key])
+            elif isinstance(first, (tuple, list)):
+                self.assertEqual(len(first), len(second))
+                for left, right in zip(first, second, strict=True):
+                    same(left, right)
+            else:
+                self.assertEqual(first, second)
+        torch.manual_seed(5)
+        batch = self.toy_batch(batch_size=8, horizon=2)
+        models = {precision: WorldModel(2, 2, hidden_dims=(8,), precision=precision)
+                  for precision in ("float32", "bfloat16")}
+        for model in models.values():
+            model.update_normalization(batch["state"], batch["action"], batch["next_state"], batch["reward"])
+            model.fit(batch)
+        saved = {precision: copy.deepcopy(model.training_state_dict()) for precision, model in models.items()}
+        self.assertNotIn("precision", saved["float32"])
+        self.assertEqual(saved["bfloat16"]["precision"], "bfloat16")
+        self.assertEqual(models["float32"].state_dict().keys(), models["bfloat16"].state_dict().keys())
+        for precision, model in models.items():
+            opposite = "bfloat16" if precision == "float32" else "float32"
+            before = copy.deepcopy(model.training_state_dict())
+            with self.assertRaisesRegex(ValueError, "training precision differs"):
+                model.load_training_state_dict(saved[opposite])
+            same(before, model.training_state_dict())
+            restored = WorldModel(2, 2, hidden_dims=(8,), precision=precision)
+            restored.load_training_state_dict(copy.deepcopy(saved[precision]))
+            same(saved[precision], restored.training_state_dict())
+            # Native resume reproduces the next optimizer update, including BF16
+            # computation with unchanged FP32 master parameters and moments.
+            model.fit(batch)
+            restored.fit(batch)
+            same(model.training_state_dict(), restored.training_state_dict())
+            weights_only = WorldModel(2, 2, hidden_dims=(8,), precision=opposite)
+            weights_only.load_state_dict(saved[precision]["model"])
+            same(weights_only.state_dict(), saved[precision]["model"])
+            self.assertEqual(weights_only.precision, opposite)
+            self.assertEqual(len(weights_only.optimizer.state), 0)
 
 
 if __name__ == "__main__":

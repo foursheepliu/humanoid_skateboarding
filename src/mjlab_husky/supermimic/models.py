@@ -83,10 +83,22 @@ def frozen_parameters(*modules):
 class WorldModel(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, hidden_dims=(512, 512, 512),
                  learning_rate=2e-4, device="cpu", gradient_clip=1.0,
-                 project_next=None, known_reward=None):
+                 project_next=None, known_reward=None, precision="float32"):
         super().__init__()
         if state_dim < 1 or action_dim < 1 or not hidden_dims or min(hidden_dims) < 1:
             raise ValueError("Model dimensions must be positive")
+        if precision not in ("float32", "bfloat16"):
+            raise ValueError("World-model precision must be float32 or bfloat16")
+        if precision == "bfloat16":
+            target_device = torch.device(device)
+            if (target_device.type not in ("cpu", "cuda")
+                    or not torch.amp.autocast_mode.is_autocast_available(target_device.type)):
+                raise ValueError("World-model BF16 requires CPU or CUDA autocast support")
+            if target_device.type == "cuda":
+                with torch.cuda.device(target_device):
+                    if not torch.cuda.is_bf16_supported():
+                        raise ValueError("This GPU does not support BF16; use precision=float32")
+        self.precision = precision
         self.state_dim, self.action_dim = state_dim, action_dim
         self.hidden_dims, self.gradient_clip = tuple(hidden_dims), gradient_clip
         # Optional task-owned constraints (e.g. exact observation-history shift).
@@ -115,6 +127,11 @@ class WorldModel(nn.Module):
         self.input_norm = RunningNorm(state_dim + action_dim)
         self.delta_norm = RunningNorm(state_dim)
         self.reward_norm = RunningNorm(1, eps=1e-2)
+        if precision == "bfloat16":
+            # Autocast never converts master weights or Adam state to BF16.
+            # Keep the existing float64 statistical accumulators unchanged.
+            for network in (self.trunk, self.delta_head, self.reward_head, self.termination_head):
+                network.float()
         self.to(device)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
         self.optimizer_updates = 0
@@ -123,6 +140,9 @@ class WorldModel(nn.Module):
     def update_normalization(self, state: Tensor, action: Tensor, next_state: Tensor,
                              reward: Tensor, next_state_valid: Tensor | None = None):
         """Call once per newly collected transition, never for replay/imagination."""
+        if self.precision == "bfloat16":
+            state, action, next_state, reward = (value.float() for value in
+                                                 (state, action, next_state, reward))
         self.input_norm.update(torch.cat((state, action), -1))
         delta = next_state - state
         if next_state_valid is not None:
@@ -139,6 +159,9 @@ class WorldModel(nn.Module):
         self.reward_norm.update(residual.reshape(-1, 1))
 
     def forward(self, state: Tensor, action: Tensor) -> Prediction:
+        if self.precision == "bfloat16":
+            return self._forward_bfloat16(state, action)
+        # Retain the original FP32 operation order and checkpoint tensor schema.
         features = self.input_norm(torch.cat((state, action), -1))
         hidden = self.trunk(features)
         prediction = Prediction(
@@ -153,6 +176,29 @@ class WorldModel(nn.Module):
             raise ValueError("Known reward dimensions differ from the total reward prediction")
         return Prediction(prediction.next_state, prediction.reward + known, prediction.termination_logit)
 
+    def _forward_bfloat16(self, state: Tensor, action: Tensor) -> Prediction:
+        # Only MLP execution is mixed precision. Normalization, analytical task
+        # terms and physical-state arithmetic stay FP32 even under outer AMP.
+        with torch.autocast(device_type=state.device.type, enabled=False):
+            state, action = state.float(), action.float()
+            features = self.input_norm(torch.cat((state, action), -1))
+            with torch.autocast(device_type=state.device.type, dtype=torch.bfloat16):
+                hidden = self.trunk(features)
+                delta = self.delta_head(hidden)
+                reward = self.reward_head(hidden)
+                termination = self.termination_head(hidden)
+            prediction = Prediction(
+                state + self.delta_norm.decode(delta.float()),
+                self.reward_norm.decode(reward.float()).squeeze(-1),
+                termination.float().squeeze(-1),
+            )
+            if self.known_reward is None:
+                return prediction
+            known = self.known_reward(state, action)
+            if known.shape != prediction.reward.shape:
+                raise ValueError("Known reward dimensions differ from the total reward prediction")
+            return Prediction(prediction.next_state, prediction.reward + known, prediction.termination_logit)
+
     def sequence_loss(self, batch: dict[str, Tensor], rollout_steps: int = 8):
         """Autoregressive state/reward/termination loss; never crosses resets.
 
@@ -161,6 +207,9 @@ class WorldModel(nn.Module):
         Reset next states are excluded from dynamics targets with
         `next_state_valid`; timeouts never become positive termination labels.
         """
+        if self.precision == "bfloat16":
+            batch = {name: value.float() if value.is_floating_point() else value
+                     for name, value in batch.items()}
         steps = min(rollout_steps, batch["state"].shape[1])
         if steps < 1:
             raise ValueError("World-model rollout must contain a transition")
@@ -221,6 +270,8 @@ class WorldModel(nn.Module):
                 "hidden_dims": self.hidden_dims}
         if self.known_reward is not None:
             state["reward_representation"] = "action_residual"
+        if self.precision != "float32":
+            state["precision"] = self.precision
         return state
 
     def load_training_state_dict(self, state):
@@ -230,6 +281,9 @@ class WorldModel(nn.Module):
         expected = "action_residual" if self.known_reward is not None else "total"
         if state.get("reward_representation", "total") != expected:
             raise ValueError("World-model reward representation differs; scalar-total and residual heads cannot be interchanged")
+        if state.get("precision", "float32") != self.precision:
+            raise ValueError("World-model training precision differs; use matching precision for optimizer resume "
+                             "or explicitly load only FP32 model weights without optimizer state")
         self.load_state_dict(state["model"])
         self.optimizer.load_state_dict(state["optimizer"])
         self.optimizer_updates = state["optimizer_updates"]
