@@ -16,6 +16,7 @@ import torch
 from torch import nn
 
 from .config import SuperMimicConfig
+from .checkpoint import atomic_torch_save
 from .env_adapter import CoupledStateAdapter
 from .replay import EpisodeSequenceReplay
 from .models import WorldModel, world_model_loss
@@ -353,9 +354,7 @@ class SuperMimicTrainer:
             "reference_normalizer": self.reference_normalizer.state_dict() if getattr(self, "reference_normalizer", None) is not None else None,
             "reference_std": getattr(self, "reference_std", None), "trust_inputs": getattr(self, "trust_inputs", None),
             "resume_scope": "Learning state restored; real simulator resets to fresh trajectories."}
-        temporary = Path(path).with_suffix(".tmp")
-        torch.save(checkpoint, temporary)
-        temporary.replace(path)
+        atomic_torch_save(checkpoint, path)
 
     def load(self, path):
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)

@@ -365,7 +365,8 @@ def main():
             raise FileExistsError("Checkpoint destination already exists")
         payload = learning_snapshot(self, budget, lineage, infos)
         temporary = destination.with_suffix(".tmp")
-        torch.save(payload, temporary)
+        with temporary.open("wb") as stream:
+            torch.save(payload, stream)
         temporary.replace(destination)
         saved = {"additional_completed": budget.completed, "cumulative_updates": budget.next_iteration,
                  "iteration": budget.next_iteration-1, "path": str(destination), "sha256": sha(destination),

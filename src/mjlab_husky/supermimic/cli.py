@@ -60,6 +60,7 @@ def main():
     from rsl_rl.modules import ActorCritic
     from tensordict import TensorDict
     from mjlab_husky.supermimic.config import SuperMimicConfig
+    from mjlab_husky.supermimic.checkpoint import atomic_torch_save
     from mjlab_husky.supermimic.trainer import SuperMimicTrainer
 
     configure_torch_backends()
@@ -154,9 +155,7 @@ def main():
                 "scope": "model, policy and style diagnostics only; no replay or optimizer resume"},
         }
         for name, contents in exports.items():
-            temporary = (directory / name).with_suffix(".tmp")
-            torch.save(contents, temporary)
-            temporary.replace(directory / name)
+            atomic_torch_save(contents, directory / name)
 
     started = time.time()
     terminal = {"status": "failed", "iterations": 0, "error": "Initialization interrupted"}

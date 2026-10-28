@@ -618,5 +618,26 @@
       "scope": "Earlier paired evaluator; not pooled with the later task-return protocol. Wider limits degraded observed tilt count/tracking in this sample."
     },
     "equal_quality_convergence_speedup_established": false
+  },
+  "large_checkpoint_readback": {
+    "original_online500_full_readable": false,
+    "original_file_bytes": 4571694355,
+    "declared_replay_storage_bytes_each": 9078571008,
+    "written_replay_storage_bytes_each": 2147479552,
+    "missing_replay_bytes": 13862182912,
+    "compact_policy_and_model_crc_finite_and_readable": true,
+    "salvaged_without_replay_bytes": 81445377,
+    "salvaged_format": "husky-supermimic-incomplete-no-replay-v1",
+    "salvage_full_resume_supported": false,
+    "retained": "four optimizers, model/policy/style, RNG, expert, validation and teacher states; intact records CRC verified",
+    "writer_fix": "explicit BufferedWriter, fsync and same-directory atomic replace",
+    "cpu_large_regression": {
+      "tests": 4,
+      "seconds": 3.084,
+      "single_storage_bytes": 2147487744,
+      "complete_sha_roundtrip": true,
+      "cuda_visible_devices": ""
+    },
+    "added_training_updates": 0
   }
 }
