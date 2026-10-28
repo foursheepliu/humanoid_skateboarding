@@ -155,6 +155,15 @@ Fixed-start survival, task reward and speed/heading errors must be considered
 together, with the same evaluation protocol and seed. A single short paired
 run screens the approach; it is not a multi-seed convergence result.
 
+If only the SuperMimic implementation changes, an already completed PPO
+training run can be reused with `--reuse-ppo-benchmark <ppo/benchmark.json>`
+and `--initial-state-file <original-shared-initial-state.pt>`. The supervisor
+checks the configuration, source files/checkpoint hashes and common weight
+identity, skips duplicate PPO training, and evaluates both policies again.
+Historical PPO training time and newly consumed training time are reported
+separately. This check does not by itself prove unchanged task/PPO source code;
+verify that separately before interpreting the comparison.
+
 A frozen world-model probe uses new real data, recorded actions and externally
 observed command/noise samples, without fitting or updating statistics:
 

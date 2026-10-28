@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
@@ -35,6 +36,8 @@ class PairedTrialConfig:
     initial_state_file: str | None = None
     resume_ppo: str | None = None
     resume_supermimic: str | None = None
+    reuse_ppo_benchmark: str | None = None
+    """Reuse a verified fresh PPO benchmark; still run both evaluations anew."""
     task: str = "Mjlab-Skater-Flat-Unitree-G1"
     snapshot_seconds: float = 120.0
     amp_preload: int = 4096
@@ -70,6 +73,14 @@ def _resolve_file(path: str, label: str):
     if not resolved.is_file():
         raise FileNotFoundError(f"{label} does not exist: {resolved}")
     return resolved
+
+
+def _sha256(path: Path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class _Supervisor:
@@ -202,6 +213,56 @@ def _validate_benchmark(report, cfg, backend):
     return checkpoint
 
 
+def _reused_ppo(cfg: PairedTrialConfig, initial: Path):
+    """Verify historical inputs without changing its report or checkpoint."""
+    path = _resolve_file(cfg.reuse_ppo_benchmark, "Reused PPO benchmark report")
+    report_hash = _sha256(path)
+    report = _read_json(path)
+    checkpoint = _validate_benchmark(report, cfg, "ppo")
+    if report["benchmark"].get("discard_iterations") != 3:
+        raise ValueError("Reused PPO discard_iterations differs from the supervised PPO configuration")
+    if report.get("resume_checkpoint") is not None or any(
+            report.get(total) != report.get(current) for total, current in (
+                ("total_iterations", "completed_iterations_this_run"),
+                ("total_real_steps", "real_steps_this_run"))):
+        raise ValueError("Reused PPO must be a fresh run with zero prior training")
+    identity = report["shared_initial_state"]
+    if identity.get("resume_initialization_identity_unverified", False):
+        raise ValueError("Reused PPO initialization identity was not verified")
+    initial_hash = _sha256(initial)
+    if identity["sha256"] != initial_hash:
+        raise ValueError("Reused PPO shared initialization SHA256 differs from --initial-state-file")
+    for starting, initial_key in (("starting_policy_sha256", "policy_sha256"),
+                                  ("starting_discriminator_sha256", "discriminator_sha256")):
+        if not identity.get(initial_key) or report.get(starting) != identity[initial_key]:
+            raise ValueError(f"Reused PPO {starting} does not match its shared initialization")
+    checkpoint_hash = _sha256(checkpoint)
+    if checkpoint_hash != report["final_checkpoint_sha256"]:
+        raise ValueError("Reused PPO final checkpoint SHA256 does not match its benchmark report")
+    commit = report.get("code", {}).get("commit") or report.get("source_commit")
+    warning = (
+        "Reused PPO benchmark has no recorded source commit; full source identity is not verified."
+        if commit is None else
+        "A historical PPO source commit is recorded; equivalence to the current source is not verified."
+    )
+    receipt = {"benchmark_report": str(path), "benchmark_report_sha256": report_hash,
+               "final_checkpoint": str(checkpoint), "final_checkpoint_sha256": checkpoint_hash,
+               "shared_initial_state_file": str(initial), "shared_initial_state_sha256": initial_hash,
+               "starting_policy_sha256": report["starting_policy_sha256"],
+               "starting_discriminator_sha256": report["starting_discriminator_sha256"],
+               "reported_source_commit": commit, "full_source_identity_verified": False,
+               "warnings": [warning]}
+    return report, receipt
+
+
+def _check_reuse_unchanged(receipt):
+    for path_key, hash_key in (("benchmark_report", "benchmark_report_sha256"),
+                               ("final_checkpoint", "final_checkpoint_sha256"),
+                               ("shared_initial_state_file", "shared_initial_state_sha256")):
+        if _sha256(Path(receipt[path_key])) != receipt[hash_key]:
+            raise ValueError(f"Reused PPO source changed during this round: {receipt[path_key]}")
+
+
 def _validate_evaluation(report, cfg, backend, benchmark):
     protocol = report["configuration"]
     if report.get("schema_version") != 2 or report.get("quality_evaluation") is not True:
@@ -259,6 +320,11 @@ def run_trial(cfg: PairedTrialConfig):
         for signum in (signal.SIGTERM, signal.SIGINT):
             old_handlers[signum] = signal.signal(signum, _interrupt)
         resume_paths = {"ppo": cfg.resume_ppo, "supermimic": cfg.resume_supermimic}
+        if cfg.reuse_ppo_benchmark is not None:
+            if cfg.initial_state_file is None:
+                raise ValueError("--reuse-ppo-benchmark requires an explicit --initial-state-file")
+            if any(resume_paths.values()):
+                raise ValueError("PPO reuse compares fresh runs and cannot be combined with resume checkpoints")
         for backend, path in resume_paths.items():
             if path is not None:
                 _resolve_file(path, f"{backend} resume checkpoint")
@@ -266,14 +332,25 @@ def run_trial(cfg: PairedTrialConfig):
             raise ValueError("A continuation round needs --initial-state-file pointing to its original shared initialization")
         initial = (Path(cfg.initial_state_file).expanduser().resolve() if cfg.initial_state_file
                    else output / "shared_initial_state.pt")
-        if any(resume_paths.values()):
+        if any(resume_paths.values()) or cfg.reuse_ppo_benchmark is not None:
             _resolve_file(str(initial), "Original shared initialization")
         elif initial.exists() and not initial.is_file():
             raise ValueError(f"Shared initialization path is not a file: {initial}")
         supervisor.status["shared_initial_state_file"] = str(initial)
         supervisor.flush()
-        benchmarks, evaluations, process_records = {}, {}, {}
+        benchmarks, evaluations, process_records, benchmark_paths = {}, {}, {}, {}
+        reused_ppo = None
+        if cfg.reuse_ppo_benchmark is not None:
+            supervisor.stage("validate_reused_ppo")
+            benchmarks["ppo"], reused_ppo = _reused_ppo(cfg, initial)
+            benchmark_paths["ppo"] = reused_ppo["benchmark_report"]
+            supervisor.status.update(reused_ppo_training=True, reused_ppo_source=reused_ppo)
+            supervisor.flush()
+            for warning in reused_ppo["warnings"]:
+                print(f"[{_utc()}] WARNING: {warning}", flush=True)
         for backend in ("ppo", "supermimic"):
+            if backend == "ppo" and reused_ppo is not None:
+                continue
             command = _benchmark_command(cfg, output, initial, backend)
             # The benchmark enforces its inclusive training budget. This extra
             # watchdog bounds a hung import, compilation or simulator startup.
@@ -284,6 +361,7 @@ def run_trial(cfg: PairedTrialConfig):
             benchmark = _read_json(path)
             _validate_benchmark(benchmark, cfg, backend)
             benchmarks[backend] = benchmark
+            benchmark_paths[backend] = str(path)
         identities = [benchmarks[backend]["shared_initial_state"]["sha256"]
                       for backend in ("ppo", "supermimic")]
         if identities[0] != identities[1]:
@@ -294,6 +372,7 @@ def run_trial(cfg: PairedTrialConfig):
                 if not benchmarks["ppo"].get(field) or benchmarks["ppo"][field] != benchmarks["supermimic"].get(field):
                     raise ValueError(f"Fresh backends did not have identical {field}")
         for backend in ("ppo", "supermimic"):
+            (output / backend).mkdir(parents=True, exist_ok=True)
             evaluation_path = output / backend / "evaluation.json"
             command = [sys.executable, "-m", "mjlab_husky.scripts.evaluate_checkpoint",
                        "--checkpoint-file", benchmarks[backend]["final_checkpoint"],
@@ -307,23 +386,35 @@ def run_trial(cfg: PairedTrialConfig):
             evaluations[backend] = evaluation
         if evaluations["ppo"]["comparison_config_sha256"] != evaluations["supermimic"]["comparison_config_sha256"]:
             raise ValueError("The two physical evaluations used different comparison configurations")
+        if reused_ppo is not None:
+            _check_reuse_unchanged(reused_ppo)
         cases = {}
         for backend in ("ppo", "supermimic"):
             benchmark, evaluation = benchmarks[backend], evaluations[backend]
-            process_seconds = process_records[f"train_{backend}"]["process_wall_seconds"]
+            reused = backend == "ppo" and reused_ppo is not None
+            process_seconds = (0.0 if reused else
+                               process_records[f"train_{backend}"]["process_wall_seconds"])
+            new_training_seconds = 0.0 if reused else benchmark["end_to_end_seconds"]
             cases[backend] = {
-                "benchmark_report": str(output / backend / "benchmark.json"),
+                "benchmark_report": benchmark_paths[backend],
+                "reused_ppo_training": reused,
+                "training_executed_this_round": not reused,
+                "benchmark_source": reused_ppo if reused else None,
                 "evaluation_report": str(output / backend / "evaluation.json"),
                 "training_configuration": benchmark["benchmark"],
                 "requested_training_wall_seconds": cfg.seconds_per_backend,
                 "actual_inclusive_training_wall_seconds": benchmark["end_to_end_seconds"],
+                "training_wall_seconds_spent_this_round": new_training_seconds,
                 "budget_overrun_seconds": benchmark.get("budget_overrun_seconds"),
                 "training_subprocess_wall_seconds": process_seconds,
-                "setup_and_process_overhead_seconds": max(0, process_seconds - benchmark["end_to_end_seconds"]),
+                "setup_and_process_overhead_seconds": max(0, process_seconds - new_training_seconds),
                 "evaluation_subprocess_wall_seconds": process_records[f"evaluate_{backend}"]["process_wall_seconds"],
                 "stop_reason": benchmark["stop_reason"],
                 "completed_iterations_this_run": benchmark["completed_iterations_this_run"],
                 "real_steps_this_run": benchmark["real_steps_this_run"],
+                "training_counters_origin": "reused_benchmark" if reused else "new_benchmark",
+                "completed_iterations_this_round": 0 if reused else benchmark["completed_iterations_this_run"],
+                "real_steps_this_round": 0 if reused else benchmark["real_steps_this_run"],
                 "prior_iterations": benchmark["total_iterations"] - benchmark["completed_iterations_this_run"],
                 "prior_real_steps": benchmark["total_real_steps"] - benchmark["real_steps_this_run"],
                 "total_iterations": benchmark["total_iterations"], "total_real_steps": benchmark["total_real_steps"],
@@ -337,20 +428,31 @@ def run_trial(cfg: PairedTrialConfig):
             }
         report = {
             "schema_version": 1, "scope": "single-round fixed-wall-budget screening",
-            "interpretation": "One seed and one bounded round. This does not establish convergence or time to target quality. Per-update durations use different numbers of real transitions.",
+            "interpretation": (
+                "PPO training is reused from a matching historical benchmark; only SuperMimic training is executed this round. Both final checkpoints are evaluated anew. Full source identity is not verified. "
+                if reused_ppo is not None else ""
+            ) + "One seed and one bounded round. This does not establish convergence or time to target quality. Per-update durations use different numbers of real transitions.",
             "configuration": asdict(cfg), "shared_initial_state_sha256": identities[0],
+            "reused_ppo_training": reused_ppo is not None,
+            "reused_ppo_source": reused_ppo,
             "initialization_identity_verified": not any(
                 benchmarks[backend]["shared_initial_state"].get("resume_initialization_identity_unverified", False)
                 for backend in ("ppo", "supermimic")),
             "continuation_mode": {"ppo": cfg.resume_ppo is not None, "supermimic": cfg.resume_supermimic is not None},
-            "prior_budget_comparability": ("Both fresh from identical initialization; zero prior training."
+            "prior_budget_comparability": ("Reused PPO and new SuperMimic both started fresh from identical initialization; matching requested training budgets are verified. PPO training time was spent in the source run."
+                                          if reused_ppo is not None else
+                                          "Both fresh from identical initialization; zero prior training."
                                           if both_fresh else
                                           "Continuation counters are reported; equality of earlier wall budgets is not verified."),
             "evaluation_comparison_config_sha256": evaluations["ppo"]["comparison_config_sha256"],
             "budget": {"requested_training_seconds_per_backend": cfg.seconds_per_backend,
-                       "requested_total_training_seconds": 2 * cfg.seconds_per_backend,
+                       "requested_total_training_seconds": (1 if reused_ppo is not None else 2) * cfg.seconds_per_backend,
+                       "requested_comparison_training_seconds": 2 * cfg.seconds_per_backend,
+                       "new_training_backends": ["supermimic"] if reused_ppo is not None else ["ppo", "supermimic"],
                        "both_reached_wall_budget": all(item["stop_reason"] == "wall_budget" for item in benchmarks.values()),
-                       "actual_total_inclusive_training_seconds": sum(case["actual_inclusive_training_wall_seconds"] for case in cases.values()),
+                       "actual_total_inclusive_training_seconds": sum(case["training_wall_seconds_spent_this_round"] for case in cases.values()),
+                       "comparison_total_inclusive_training_seconds": sum(case["actual_inclusive_training_wall_seconds"] for case in cases.values()),
+                       "reused_training_seconds": cases["ppo"]["actual_inclusive_training_wall_seconds"] if reused_ppo is not None else 0.0,
                        "supervisor_wall_seconds": time.monotonic() - supervisor.started,
                        "training_clock_includes": benchmarks["ppo"].get("training_clock_includes"),
                        "setup_and_evaluation_are_outside_training_budget": True,
