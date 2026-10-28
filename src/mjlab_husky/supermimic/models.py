@@ -154,21 +154,49 @@ def _field(batch, *names, default=None):
     return default
 
 
+def detach_exogenous(value):
+    """Keep externally supplied random commands outside the differentiable graph."""
+    if isinstance(value, torch.Tensor):
+        return value.detach()
+    if isinstance(value, Mapping):
+        return {name: detach_exogenous(item) for name, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(detach_exogenous(item) for item in value)
+    if isinstance(value, list):
+        return [detach_exogenous(item) for item in value]
+    return value
+
+
 def projection_function(project):
-    """Accept legacy two-argument projections and action-aware task adapters."""
+    """Adapt two/three-argument projections and keyword-only exogenous inputs.
+
+    The returned callable always accepts (previous, predicted, action,
+    exogenous=None). Older projections ignore the optional exogenous value.
+    """
     if project is None:
-        return lambda previous, predicted, action: predicted
-    parameters = inspect.signature(project).parameters.values()
+        return lambda previous, predicted, action, exogenous=None: predicted
+    parameters = tuple(inspect.signature(project).parameters.values())
     uses_action = any(p.kind == p.VAR_POSITIONAL for p in parameters) or sum(
         p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in parameters
     ) >= 3
+    uses_exogenous = any(
+        p.kind == p.VAR_KEYWORD or
+        (p.name == "exogenous" and p.kind != p.POSITIONAL_ONLY)
+        for p in parameters
+    )
+    if uses_action and uses_exogenous:
+        return lambda previous, predicted, action, exogenous=None: project(
+            previous, predicted, action, exogenous=exogenous)
+    if uses_exogenous:
+        return lambda previous, predicted, action, exogenous=None: project(
+            previous, predicted, exogenous=exogenous)
     if uses_action:
-        return lambda previous, predicted, action: project(previous, predicted, action)
-    return lambda previous, predicted, action: project(previous, predicted)
+        return lambda previous, predicted, action, exogenous=None: project(previous, predicted, action)
+    return lambda previous, predicted, action, exogenous=None: project(previous, predicted)
 
 
 def world_model_loss(model, batch, *, project=None, reward_weight=1.0,
-                     termination_weight=1.0, horizon=8):
+                     termination_weight=1.0, horizon=8, exogenous_from_state=None):
     """Eight-step autoregressive dynamics/reward/physical-failure fitting.
 
     `valid` gates NEXT-STATE regression (terminal post-reset data is unavailable).
@@ -176,6 +204,10 @@ def world_model_loss(model, batch, *, project=None, reward_weight=1.0,
     real terminal is masked out, even if a caller supplies a padded window.
     Time-limit truncations must be excluded from the physical `dones` labels by
     the environment adapter, or supplied separately as `terminated`.
+
+    An optional adapter extractor supplies ONLY recorded external commands to
+    projection. Physical quantities must not be included: robot/board dynamics
+    remain autoregressive and are compared against independent real targets.
     """
     states = _field(batch, "states", "state")
     actions = _field(batch, "actions", "action")
@@ -207,7 +239,11 @@ def world_model_loss(model, batch, *, project=None, reward_weight=1.0,
     for step in range(length):
         context_t = context[:, step] if context is not None and context.ndim == 3 else context
         prediction = model(state, actions[:, step], context_t)
-        next_state = project_next(state, prediction["next_state"], actions[:, step])
+        exogenous = None
+        if exogenous_from_state is not None:
+            with torch.no_grad():
+                exogenous = detach_exogenous(exogenous_from_state(states[:, step + 1].detach()))
+        next_state = project_next(state, prediction["next_state"], actions[:, step], exogenous)
         input_mask = active & transition_valid[:, step].bool()
         state_mask = input_mask & valid[:, step].bool()
         normalized_error = (next_state - states[:, step + 1]) / model.delta_norm.std

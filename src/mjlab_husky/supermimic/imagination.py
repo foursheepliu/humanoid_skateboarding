@@ -7,7 +7,7 @@ from contextlib import contextmanager
 
 import torch
 
-from .models import projection_function
+from .models import projection_function, detach_exogenous
 
 
 @contextmanager
@@ -54,7 +54,7 @@ def critic_loss(values, targets, mask=None):
 
 def imagine(actor_critic, world, starts, state_to_observations, *, horizon=32,
             gamma=0.99, lam=0.95, context=None, project=None,
-            reward_callback=None, additional_frozen_modules=()):
+            reward_callback=None, additional_frozen_modules=(), exogenous_sampler=None):
     """Return a genuine learned-model actor objective and detached critic data.
 
     The original HUSKY ActorCritic is reused for compatible actor/normalizer
@@ -64,6 +64,10 @@ def imagine(actor_critic, world, starts, state_to_observations, *, horizon=32,
       (state, action, next_state, predicted_task_reward, step_index)
     and returns total reward. Its discriminator should appear in
     `additional_frozen_modules` so its input gradient reaches the actor.
+
+    Optional external commands are sampled from a DETACHED current state and
+    passed only to projection. No sampler Jacobian or future physical target is
+    introduced into actor BPTT; physical dynamics retain their learned gradient.
     """
     if horizon < 1:
         raise ValueError("Imagined horizon must be positive")
@@ -87,7 +91,11 @@ def imagine(actor_critic, world, starts, state_to_observations, *, horizon=32,
             action = actor_critic.act_inference(observation)
             context_t = context[:, step] if context is not None and context.ndim == 3 else context
             prediction = world(state, action, context_t)
-            next_state = project_next(state, prediction["next_state"], action)
+            exogenous = None
+            if exogenous_sampler is not None:
+                with torch.no_grad():
+                    exogenous = detach_exogenous(exogenous_sampler(state.detach()))
+            next_state = project_next(state, prediction["next_state"], action, exogenous)
             reward = prediction["reward"]
             if reward_callback is not None:
                 reward = reward_callback(state, action, next_state, reward, step)

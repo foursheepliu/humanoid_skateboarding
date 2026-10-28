@@ -2,6 +2,7 @@
 import argparse
 from dataclasses import asdict
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -17,10 +18,14 @@ def main():
     parser.add_argument("--run-name", default="train")
     parser.add_argument("--iterations", type=int, required=True,
                         help="Explicit total SuperMimic iterations; these are not PPO updates")
+    parser.add_argument("--max-seconds", type=float,
+                        help="Optional wall-time limit from warmup onward; stops after a completed update")
     parser.add_argument("--num-envs", type=int, default=4096)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--replay-device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--skip-final-checkpoint", action="store_true", help="Diagnostic runs: export actor only; no resume snapshot")
+    parser.add_argument("--diagnostic-interval", type=int, default=0,
+                        help="Optional policy/world diagnostic export interval; does not include replay or optimizer resume")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--warm-start", type=Path, help="Policy-only warm start from legacy PPO checkpoint")
     parser.add_argument("--resume", type=Path, help="Full learning-state SuperMimic checkpoint")
@@ -30,6 +35,10 @@ def main():
             ("hidden-width", 512), ("expert-transitions", 200000), ("save-interval", 100)]:
         parser.add_argument("--" + name, type=int, default=default)
     args = parser.parse_args()
+    if args.max_seconds is not None and (not math.isfinite(args.max_seconds) or args.max_seconds <= 0):
+        parser.error("--max-seconds must be finite and positive")
+    if args.diagnostic_interval < 0:
+        parser.error("--diagnostic-interval must be nonnegative")
     if args.warm_start and args.resume:
         parser.error("Choose warm start or resume")
     import mjlab.tasks  # Initialize the base package before custom plugin discovery.
@@ -53,6 +62,8 @@ def main():
         saved = torch.load(args.resume, map_location="cpu", weights_only=False)
         if saved.get("format") != "husky-supermimic-v1":
             raise ValueError("Use --warm-start for a legacy PPO policy")
+        if saved.get("dynamics_protocol") != "conditional-commands-v2":
+            raise ValueError("World-model command protocol differs; explicit migration is required")
         settings = dict(saved["config"])
         for name in fields:
             flag = "--" + name.replace("_", "-")
@@ -69,8 +80,8 @@ def main():
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     args.out = args.out.resolve()
-    if (args.out / "log" / args.run_name / "updates.jsonl").exists() and not args.resume:
-        raise FileExistsError("Use a fresh output directory or explicitly resume")
+    if (args.out / "log" / args.run_name / "updates.jsonl").exists():
+        raise FileExistsError("Use a fresh run name, including when resuming, to preserve the previous ledger")
     env_cfg = load_env_cfg("Mjlab-Skater-Flat-Unitree-G1")
     env_cfg.scene.num_envs = cfg.num_envs
     env_cfg.seed = cfg.seed
@@ -86,6 +97,25 @@ def main():
         policy.load_state_dict(saved["model_state_dict"])
     trainer = SuperMimicTrainer(env, policy, cfg, args.out, run_name=args.run_name)
     trainer.warm_started = bool(args.warm_start)
+
+    def export_diagnostic(directory):
+        directory.mkdir(parents=True, exist_ok=True)
+        exports = {
+            "policy_final.pt": {"model_state_dict": policy.state_dict(), "algorithm": "supermimic",
+                "iteration": trainer.iteration, "resume_scope": "policy-only diagnostic export"},
+            "model_diagnostic.pt": {"world": trainer.world.state_dict(), "world_architecture": trainer.world.architecture(),
+                "validation_batch": trainer.validation_batch, "layout": trainer.adapter.layout,
+                "history_terms": trainer.adapter.history_terms, "critic_terms": trainer.adapter.critic_terms,
+                "qpos_quaternion_slices": trainer.adapter.qpos_quaternion_slices,
+                "config": asdict(cfg), "iteration": trainer.iteration,
+                "dynamics_protocol": "conditional-commands-v2",
+                "scope": "model diagnostics only, no replay or optimizer resume"},
+        }
+        for name, contents in exports.items():
+            temporary = (directory / name).with_suffix(".tmp")
+            torch.save(contents, temporary)
+            temporary.replace(directory / name)
+
     started = time.time()
     terminal = {"status": "failed", "iterations": 0, "error": "Initialization interrupted"}
     try:
@@ -97,26 +127,24 @@ def main():
             trainer.collect(cfg.warmup_steps)
         warmup_finished = time.time()
         while trainer.iteration < cfg.iterations:
+            if args.max_seconds is not None and time.time() - started >= args.max_seconds:
+                break
             record = trainer.update()
             if trainer.iteration % cfg.log_interval == 0 or trainer.iteration == 1:
                 print(json.dumps(record), flush=True)
             if trainer.iteration % cfg.save_interval == 0:
                 trainer.save(trainer.paths["checkpoints"] / f"training_{trainer.iteration}.pt")
+            if args.diagnostic_interval and trainer.iteration % args.diagnostic_interval == 0:
+                export_diagnostic(trainer.paths["checkpoints"] / f"diagnostic_{trainer.iteration}")
         if not args.skip_final_checkpoint:
             trainer.save(trainer.paths["checkpoints"] / "final.pt")
         else:
-            torch.save({"model_state_dict": policy.state_dict(), "algorithm": "supermimic", "iteration": trainer.iteration,
-                        "resume_scope": "policy-only diagnostic export"}, trainer.paths["checkpoints"] / "policy_final.pt")
-            torch.save({"world": trainer.world.state_dict(), "world_architecture": trainer.world.architecture(),
-                        "validation_batch": trainer.validation_batch, "layout": trainer.adapter.layout,
-                        "history_terms": trainer.adapter.history_terms, "critic_terms": trainer.adapter.critic_terms,
-                        "qpos_quaternion_slices": trainer.adapter.qpos_quaternion_slices,
-                        "config": asdict(cfg), "iteration": trainer.iteration,
-                        "scope": "model diagnostics only, no replay or optimizer resume"},
-                        trainer.paths["checkpoints"] / "model_diagnostic.pt")
-        terminal = {"status": "completed", "iterations": trainer.iteration,
+            export_diagnostic(trainer.paths["checkpoints"])
+        terminal = {"status": "completed" if trainer.iteration >= cfg.iterations else "stopped_time_limit",
+                    "iterations": trainer.iteration,
                     "real_env_steps": trainer.real_steps, "elapsed_seconds": time.time()-started,
                     "warmup_seconds": warmup_finished-started,
+                    "max_seconds": args.max_seconds,
                     "budget": cfg.iterations, "algorithm": "coupled-world-model+BPTT+adversarial-style"}
     except BaseException as error:
         terminal = {"status": "failed", "iterations": trainer.iteration, "error": repr(error)}

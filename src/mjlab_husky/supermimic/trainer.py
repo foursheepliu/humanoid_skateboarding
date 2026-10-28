@@ -276,7 +276,8 @@ class SuperMimicTrainer:
         diagnostics = {}
         for _ in range(self.cfg.model_updates):
             batch = self.sample(self.cfg.model_batch, self.cfg.model_window, self.train_env_ids)
-            losses = world_model_loss(self.world, batch, project=self.adapter.project, horizon=self.cfg.model_window)
+            losses = world_model_loss(self.world, batch, project=self.adapter.project,
+                exogenous_from_state=self.adapter.exogenous_from_state, horizon=self.cfg.model_window)
             checked_step(losses["loss"], self.world_optimizer, self.world.parameters())
             diagnostics = {"model_" + k: v.detach() for k, v in losses.items()}
         for _ in range(self.cfg.discriminator_updates):
@@ -291,6 +292,7 @@ class SuperMimicTrainer:
             self.adapter.state_to_observations, horizon=self.cfg.imagination_horizon,
             gamma=self.cfg.gamma, lam=self.cfg.lam, context=starts["context"][:, 0],
             project=self.adapter.project, reward_callback=self.style_reward,
+            exogenous_sampler=self.adapter.sample_exogenous,
             additional_frozen_modules=(self.discriminator,))
         diagnostics.update(self.actor_step(imagined, starts["states"][:, 0]))
         values = self.policy.evaluate(imagined["critic_observations"]).reshape_as(imagined["targets"])
@@ -303,6 +305,7 @@ class SuperMimicTrainer:
         if self.iteration == 1 or self.iteration % self.cfg.log_interval == 0:
             with torch.no_grad():
                 validation = world_model_loss(self.world, self.validation_batch, project=self.adapter.project,
+                                              exogenous_from_state=self.adapter.exogenous_from_state,
                                               horizon=self.cfg.model_window)
                 diagnostics.update({"heldout_" + k: v.detach() for k, v in validation.items()})
         synchronize(self.device)
@@ -332,6 +335,7 @@ class SuperMimicTrainer:
     def save(self, path):
         """Restore learning state; simulator continuation starts a new real rollout."""
         checkpoint = {"format": "husky-supermimic-v1", "model_state_dict": self.policy.state_dict(),
+            "dynamics_protocol": "conditional-commands-v2",
             "world": self.world.state_dict(), "discriminator": self.discriminator.state_dict(),
             "style_normalizer": self.style_norm.state_dict(), "config": asdict(self.cfg),
             "iteration": self.iteration, "real_steps": self.real_steps,
@@ -355,6 +359,8 @@ class SuperMimicTrainer:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         if checkpoint.get("format") != "husky-supermimic-v1":
             raise ValueError("Legacy PPO checkpoint is a policy warm start, not a SuperMimic resume")
+        if checkpoint.get("dynamics_protocol") != "conditional-commands-v2":
+            raise ValueError("World-model command protocol differs; explicit migration is required")
         saved_config, requested_config = dict(checkpoint["config"]), asdict(self.cfg)
         saved_config.pop("iterations")
         requested_config.pop("iterations")

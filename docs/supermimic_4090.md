@@ -133,3 +133,17 @@ The tests cover gradients through the frozen coupled model/critic/style callback
 ## Attribution
 
 Adapted protocol/code provenance and the Apache-2.0 license are in `third_party/supermimic/`. HUSKY task/assets retain their original terms.
+
+## Conditional command protocol (nightly follow-up)
+
+The task samples a new relative heading when push-to-steer ends. The previous model projection incorrectly kept that command fixed. The conditional protocol supplies only recorded external command values during fitting and validation; imagined rollouts sample commands from the original task ranges. Physical state, heading reference and observations are never copied from a future real target. The heading reference is reconstructed from predicted board orientation. Still/phase transitions use the preceding command, matching the task's update order.
+
+Full snapshots now carry `dynamics_protocol=conditional-commands-v2`. Earlier snapshots require explicit migration and are rejected as full resumes. Policy warm starts remain compatible. Resumed runs require a fresh run name to preserve prior ledgers.
+
+The conditional implementation passed **39 tests**, including CUDA replay transport, and real-environment smoke, diagnostic exports and full learning-state resume. Its 50-step diagnostic loop averaged **0.71747 seconds** over the last 30 steps. The earlier 0.62010-second result above describes the previous implementation; the correctness fix adds work.
+
+In a separate 64-environment, 30-second play evaluation over the original command ranges, teacher and conditional-50 policy had identical initial-state and complete command-sequence hashes. Both had five environments with observed root tilt above 70 degrees. Pooled pushing velocity MAE was 0.13532/0.13286 m/s and heading MAE 0.22158/0.22071 rad (teacher/candidate). This preserves behavior in this diagnostic sample; it does not establish a statistically significant improvement or a formal success rate.
+
+`tools/audit_supermimic_model.py` measures 1/8/16/32-step open-loop predictions against the same recorded real actions, with physical-unit groups, phase-boundary groups and frozen normalizers. Changing only command projection improves command/observation consistency, with a small physical-state effect. A separately retrained 50-step model has mixed physical errors; comparing losses under different normalizers cannot establish a better model. Model refinement and precision measurements are ongoing.
+
+`--max-seconds` limits learning time from warmup onward and checks between completed updates. Initialization, an in-progress update and checkpoint writing can extend wall time; allow a margin before an independent overall deadline. `--diagnostic-interval` exports policy/world snapshots without replay or optimizer resume state.

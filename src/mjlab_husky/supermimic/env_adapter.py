@@ -74,6 +74,7 @@ class CoupledStateAdapter:
         self.history_terms = self._history_layout("policy")
         self.critic_terms = self._history_layout("critic")
         self.qpos_quaternion_slices = self._quaternion_layout()
+        self.board_quaternion_slice = self._root_quaternion_slice("skateboard")
         self.context_layout = {}
         self._context = self._make_context()
         self.context_dim = self._context.shape[-1]
@@ -153,6 +154,118 @@ class CoupledStateAdapter:
                 result.append(slice(base + int(address), base + int(address) + 4))
         return result
 
+    def _root_quaternion_slice(self, entity_name):
+        model = self.env.sim.mj_model
+        if "qpos" not in self.layout or not hasattr(model, "jnt_type"):
+            return None
+        for index, (kind, address) in enumerate(zip(model.jnt_type, model.jnt_qposadr)):
+            if int(kind) != 0:
+                continue
+            if callable(getattr(model, "joint", None)):
+                name = model.joint(index).name
+            else:
+                names = getattr(model, "joint_names", [])
+                name = names[index] if index < len(names) else ""
+            if entity_name in str(name):
+                base = self.layout["qpos"].start + int(address) + 3
+                return slice(base, base + 4)
+        return None
+
+    def board_yaw_from_state(self, state):
+        """Heading of the predicted deck root; no future real physics is used."""
+        if self.board_quaternion_slice is None:
+            return None
+        q = state[..., self.board_quaternion_slice].clone()
+        q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        w, x, y, z = q.unbind(-1)
+        return torch.atan2(2 * (w * z + x * y), 1 - 2 * (y.square() + z.square()))
+
+    def _next_phase(self, previous):
+        clock = previous[..., self.layout["phase_length_buf"]].squeeze(-1) + 1
+        if "command_b" in self.layout:
+            still = previous[..., self.layout["command_b"]][..., 0] < 0.1
+        else:
+            still = previous[..., self.layout["still"]].squeeze(-1) > 0.5
+        half = max(1, round(self.env.cycle_time / 2 / self.env.step_dt))
+        clock = torch.where(still & ((clock - 1).remainder(half) == 0), torch.zeros_like(clock), clock)
+        phase = (clock * self.env.step_dt / self.env.cycle_time).remainder(1)
+        ratios = self.env.cfg.phase_ratios
+        phases = torch.stack(((phase >= ratios[0]) & (phase < ratios[1]),
+                              (phase >= ratios[2]) & (phase < ratios[3]),
+                              (phase >= ratios[1]) & (phase < ratios[2]),
+                              (phase >= ratios[3]) & (phase <= ratios[4])), -1)
+        return clock, phase, phases.to(previous.dtype) * (~still)[..., None], still
+
+    def _command_events(self, previous, next_phase):
+        cfg = getattr(self.command_term, "cfg", None)
+        shape = previous.shape[:-1]
+        timer = (previous[..., self.layout["time_left"]].squeeze(-1) <= self.env.step_dt
+                 if "time_left" in self.layout else torch.zeros(shape, device=previous.device, dtype=torch.bool))
+        exit_push = ((previous[..., self.layout["phase"]][..., 2] > 0.5)
+                     & (next_phase[..., 2] < 0.5))
+        if cfg is None or not getattr(cfg, "heading_command", False):
+            exit_push = torch.zeros_like(exit_push)
+        return cfg, timer, exit_push
+
+    def exogenous_from_state(self, next_state):
+        """Condition model fitting on recorded external goals, never physics.
+
+        A heading draw is intrinsically unpredictable. These four fields are the
+        only teacher-forced quantities; heading_ref is rebuilt from predicted
+        board yaw, so recorded future board poses cannot leak into dynamics.
+        """
+        return {name: next_state[..., self.layout[name]].detach()
+                for name in ("command_b", "is_heading_env", "is_standing_env", "time_left")
+                if name in self.layout}
+
+    @torch.no_grad()
+    def sample_exogenous(self, previous, generator=None):
+        """Sample the HUSKY command process independently of model prediction.
+
+        Heading resamples at push->steer completion (ticks150/450/750 for the
+        six-second moving cycle). Ordinary command timers also resample speed
+        and standing/heading flags according to the original configuration.
+        Random values are generated only when some row has an actual event;
+        this preserves the distribution, not the original simulator RNG stream.
+        """
+        result = {name: previous[..., self.layout[name]].detach().clone()
+                  for name in ("command_b", "is_heading_env", "is_standing_env", "time_left")
+                  if name in self.layout}
+        _, _, next_phase, _ = self._next_phase(previous)
+        cfg, timer, exit_push = self._command_events(previous, next_phase)
+        if "time_left" in result:
+            result["time_left"].sub_(self.env.step_dt)
+        if cfg is None:
+            return result
+        shape = previous.shape[:-1]
+
+        def uniform(low, high):
+            if low == high:
+                return torch.full(shape, float(low), device=previous.device, dtype=previous.dtype)
+            return torch.rand(shape, device=previous.device, dtype=previous.dtype, generator=generator) * (high - low) + low
+
+        if bool(timer.any()):
+            speed = uniform(*cfg.ranges.lin_vel_x)
+            result["command_b"][..., 0] = torch.where(timer, speed, result["command_b"][..., 0])
+            if "is_heading_env" in result:
+                heading = uniform(0., 1.) <= cfg.rel_heading_envs
+                result["is_heading_env"] = torch.where(timer[..., None], heading[..., None].float(), result["is_heading_env"])
+            if "is_standing_env" in result:
+                standing = uniform(0., 1.) <= cfg.rel_standing_envs
+                result["is_standing_env"] = torch.where(timer[..., None], standing[..., None].float(), result["is_standing_env"])
+            if "time_left" in result:
+                duration = uniform(*cfg.resampling_time_range)
+                result["time_left"] = torch.where(timer[..., None], duration[..., None], result["time_left"])
+        heading_env = result.get("is_heading_env", torch.ones((*shape, 1), device=previous.device)).squeeze(-1) > 0.5
+        heading_event = (timer | exit_push) & heading_env & bool(getattr(cfg, "heading_command", False))
+        if bool(heading_event.any()):
+            heading = uniform(*cfg.ranges.heading)
+            result["command_b"][..., 1] = torch.where(heading_event, heading, result["command_b"][..., 1])
+        if "is_standing_env" in result:
+            standing = result["is_standing_env"].squeeze(-1) > 0.5
+            result["command_b"] = torch.where(standing[..., None], torch.zeros_like(result["command_b"]), result["command_b"])
+        return result
+
     def _make_context(self):
         pieces, offset = [], 0
 
@@ -208,7 +321,7 @@ class CoupledStateAdapter:
     def push_mask_from_state(self, state):
         return state[..., self.layout["phase"]][..., 0].clamp(0, 1)
 
-    def project(self, previous, predicted, action=None):
+    def project(self, previous, predicted, action=None, *, exogenous=None):
         """Enforce exact history shifts while retaining differentiable new frames."""
         result = predicted.clone()
         for term in self.history_terms:
@@ -232,18 +345,44 @@ class CoupledStateAdapter:
             if name in self.layout:
                 result[..., self.layout[name]] = previous[..., self.layout[name]] + 1
         if "phase_length_buf" in self.layout and "phase" in self.layout:
-            clock = result[..., self.layout["phase_length_buf"]].squeeze(-1)
-            still = previous[..., self.layout["still"]].squeeze(-1) > 0.5
-            half = max(1, round(self.env.cycle_time / 2 / self.env.step_dt))
-            clock = torch.where(still & ((clock - 1).remainder(half) == 0), torch.zeros_like(clock), clock)
+            clock, _, phases, still = self._next_phase(previous)
             result[..., self.layout["phase_length_buf"]] = clock[..., None]
-            phase = (clock * self.env.step_dt / self.env.cycle_time).remainder(1)
-            ratios = self.env.cfg.phase_ratios
-            phases = torch.stack(((phase >= ratios[0]) & (phase < ratios[1]),
-                                  (phase >= ratios[2]) & (phase < ratios[3]),
-                                  (phase >= ratios[1]) & (phase < ratios[2]),
-                                  (phase >= ratios[3]) & (phase <= ratios[4])), -1)
-            result[..., self.layout["phase"]] = phases.to(result.dtype) * (~still)[..., None]
+            result[..., self.layout["phase"]] = phases
+            result[..., self.layout["still"]] = still[..., None].to(result.dtype)
+        allowed_exogenous = {"command_b", "is_heading_env", "is_standing_env", "time_left"}
+        if exogenous is not None:
+            if set(exogenous) - allowed_exogenous:
+                raise ValueError("Only external command fields may be supplied to projection")
+            for name, value in exogenous.items():
+                if name not in self.layout or value.shape != previous[..., self.layout[name]].shape:
+                    raise ValueError("External command field shape differs from the state layout")
+        if "phase" in self.layout and "command_b" in self.layout:
+            cfg, timer, exit_push = self._command_events(previous, result[..., self.layout["phase"]])
+            for name in ("is_heading_env", "is_standing_env"):
+                if name in self.layout:
+                    target = predicted[..., self.layout[name]].clamp(0, 1) if exogenous is None else exogenous.get(name, previous[..., self.layout[name]])
+                    result[..., self.layout[name]] = torch.where(timer[..., None], target, previous[..., self.layout[name]])
+            heading_env = (result[..., self.layout["is_heading_env"]].squeeze(-1) > 0.5
+                           if "is_heading_env" in self.layout else torch.ones_like(timer))
+            heading_event = (timer | exit_push) & heading_env & bool(getattr(cfg, "heading_command", False))
+            commands = previous[..., self.layout["command_b"]].clone()
+            target = predicted[..., self.layout["command_b"]].clone() if exogenous is None else exogenous.get("command_b", commands)
+            if exogenous is None and cfg is not None:
+                target = torch.stack((target[..., 0].clamp(*cfg.ranges.lin_vel_x),
+                                      target[..., 1].clamp(*cfg.ranges.heading) if cfg.ranges.heading is not None else target[..., 1]), -1)
+            commands[..., 0] = torch.where(timer, target[..., 0], commands[..., 0])
+            commands[..., 1] = torch.where(heading_event, target[..., 1], commands[..., 1])
+            if "is_standing_env" in self.layout:
+                standing = result[..., self.layout["is_standing_env"]].squeeze(-1) > 0.5
+                commands = torch.where(standing[..., None], torch.zeros_like(commands), commands)
+            result[..., self.layout["command_b"]] = commands
+            if "time_left" in self.layout:
+                before = previous[..., self.layout["time_left"]]
+                target_time = (exogenous.get("time_left", predicted[..., self.layout["time_left"]])
+                               if exogenous is not None else predicted[..., self.layout["time_left"]])
+                if exogenous is None and cfg is not None and cfg.resampling_time_range[0] == cfg.resampling_time_range[1]:
+                    target_time = torch.full_like(before, cfg.resampling_time_range[0])
+                result[..., self.layout["time_left"]] = torch.where(timer[..., None], target_time, before - self.env.step_dt)
         # Commands stay fixed within a phase. Heading reference can change at
         # push->steer completion, and Bezier starts only at the two entry edges.
         if "phase" in self.layout:
@@ -261,8 +400,9 @@ class CoupledStateAdapter:
                     result[..., self.layout[name]] = flag.to(result.dtype)[..., None]
             if "heading_ref_b" in self.layout:
                 sl = self.layout["heading_ref_b"]
-                resample = (old_phase[..., 2] > 0.5) & (new_phase[..., 1] > 0.5)
-                result[..., sl] = torch.where(resample[..., None], result[..., sl], previous[..., sl])
+                board_yaw = self.board_yaw_from_state(result)
+                reference = result[..., sl].clone() if board_yaw is None else board_yaw[..., None]
+                result[..., sl] = torch.where(heading_event[..., None], reference, previous[..., sl])
             for name, sl in self.layout.items():
                 if name.startswith("bezier_"):
                     phase_index = 2 if "push2steer" in name else 3
@@ -284,6 +424,12 @@ class CoupledStateAdapter:
                                * self.env.step_dt / self.env.cycle_time).remainder(1)
         if "phase" in self.layout:
             known["contact_phase"] = result[..., self.layout["phase"]].clone()
+        if "heading_ref_b" in self.layout and "command_b" in self.layout:
+            board_yaw = self.board_yaw_from_state(result)
+            if board_yaw is not None:
+                error = (result[..., self.layout["heading_ref_b"]].clone()
+                         + result[..., self.layout["command_b"]][..., 1:2].clone() - board_yaw[..., None])
+                known["heading_error"] = (error + math.pi).remainder(2 * math.pi) - math.pi
         # Actor flattened history is term-major; critic terms have one frame.
         # Known exogenous/action fields must agree with their raw state copies.
         for term in self.history_terms + self.critic_terms:

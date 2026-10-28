@@ -9,7 +9,7 @@ import unittest
 import torch
 from torch import nn
 
-from mjlab_husky.supermimic.models import RunningMoments, WorldModel, world_model_loss
+from mjlab_husky.supermimic.models import RunningMoments, WorldModel, world_model_loss, projection_function
 from mjlab_husky.supermimic.imagination import imagine, gae_targets, critic_loss
 
 
@@ -43,6 +43,37 @@ class CoupledOracle(nn.Module):
         next_state = torch.cat((robot_next, board_next), dim=-1)
         return {"next_state": next_state, "reward": -board_next.square().sum(-1),
                 "termination_probability": state.new_full((len(state),), 0.01)}
+
+
+class ExternalCommandWorld(nn.Module):
+    """Five physical coordinates and one externally randomized command."""
+    def __init__(self, gain=0.1):
+        super().__init__()
+        self.gain = nn.Parameter(torch.tensor(float(gain)))
+        self.delta_norm = RunningMoments(6)
+        self.reward_norm = RunningMoments(1)
+
+    def forward(self, state, action, context=None):
+        increment = torch.cat((action, action[:, :1] * 0.5,
+                               torch.zeros_like(action)), dim=-1)
+        physical = state[:, :5] + self.gain * increment
+        nxt = torch.cat((physical, state[:, 5:6]), dim=-1)
+        zero_reward = physical.sum(-1) * 0
+        logits = state.new_full((len(state),), -4.0)
+        return {"next_state": nxt, "reward": zero_reward,
+                "normalized_reward": zero_reward, "termination_logit": logits,
+                "termination_probability": torch.sigmoid(logits)}
+
+
+def command_projection(previous, predicted, action=None, *, exogenous=None):
+    command = previous[:, 5:6] if exogenous is None else exogenous["command"]
+    # Only the command is supplied externally; all physical coordinates remain
+    # the world's own autoregressive prediction, including any model error.
+    return torch.cat((predicted[:, :5], command), dim=-1)
+
+
+def command_observations(state):
+    return {"policy": torch.cat((state[:, :3], state[:, 5:6]), -1), "critic": state}
 
 
 class SuperMimicModelsTest(unittest.TestCase):
@@ -197,6 +228,108 @@ class SuperMimicModelsTest(unittest.TestCase):
             model(torch.randn(2, 6), torch.randn(2, 2))
         result = model(torch.randn(2, 6), torch.randn(2, 2), torch.randn(2, 3))
         self.assertTrue(all(x.dtype == torch.float32 for x in result.values()))
+
+    def command_batch(self):
+        batch, horizon = 4, 8
+        actions = torch.randn(batch, horizon, 2)
+        state = torch.zeros(batch, 6)
+        state[:, 5] = torch.randn(batch)
+        states = [state]
+        true_world = ExternalCommandWorld(gain=0.2)
+        with torch.no_grad():
+            for step in range(horizon):
+                nxt = true_world(state, actions[:, step])["next_state"]
+                nxt[:, 5] = torch.randn(batch)  # Unpredictable external draws.
+                states.append(nxt)
+                state = nxt
+        return {"states": torch.stack(states, 1), "actions": actions,
+                "rewards": torch.zeros(batch, horizon),
+                "dones": torch.zeros(batch, horizon, dtype=torch.bool),
+                "valid": torch.ones(batch, horizon, dtype=torch.bool)}
+
+    def test_projection_signature_compatibility_with_optional_external_commands(self):
+        previous, predicted, action = torch.zeros(2, 6), torch.ones(2, 6), torch.ones(2, 2)
+        external = {"command": torch.full((2, 1), 9.0)}
+        two = projection_function(lambda old, pred: pred + 1)
+        three = projection_function(lambda old, pred, act: pred + act.sum(-1, keepdim=True))
+        torch.testing.assert_close(two(previous, predicted, action, external), predicted + 1)
+        torch.testing.assert_close(three(previous, predicted, action, external), predicted + 2)
+        four = projection_function(command_projection)
+        torch.testing.assert_close(four(previous, predicted, action, external)[:, -1], external["command"].squeeze(-1))
+        torch.testing.assert_close(four(previous, predicted, action)[:, -1], previous[:, -1])
+        torch.testing.assert_close(projection_function(None)(previous, predicted, action, external), predicted)
+
+    def test_random_command_targets_do_not_pollute_physical_model_loss_or_gradient(self):
+        batch = self.command_batch()
+        changed_commands = copy.deepcopy(batch)
+        changed_commands["states"][:, :, 5] = torch.randn_like(batch["states"][:, :, 5]) * 100
+        first, second = ExternalCommandWorld(0.1), ExternalCommandWorld(0.1)
+        extract = lambda recorded: {"command": recorded[:, 5:6]}
+        loss1 = world_model_loss(first, batch, project=command_projection, exogenous_from_state=extract)
+        loss2 = world_model_loss(second, changed_commands, project=command_projection, exogenous_from_state=extract)
+        torch.testing.assert_close(loss1["state"], loss2["state"], rtol=0, atol=0)
+        loss1["loss"].backward()
+        loss2["loss"].backward()
+        torch.testing.assert_close(first.gain.grad, second.gain.grad, rtol=0, atol=0)
+        self.assertGreater(float(first.gain.grad.abs()), 1e-6)
+
+    def test_external_command_replay_does_not_teacher_force_physical_targets(self):
+        batch = self.command_batch()
+        model = ExternalCommandWorld(gain=0.2)
+        extract = lambda recorded: {"command": recorded[:, 5:6]}
+        matched = world_model_loss(model, batch, project=command_projection, exogenous_from_state=extract)
+        self.assertLess(float(matched["state"].detach()), 1e-12)
+        default = world_model_loss(model, batch, project=command_projection)
+        self.assertGreater(float(default["state"].detach()), 0.01)
+        corrupted_physics = copy.deepcopy(batch)
+        corrupted_physics["states"][:, -1, 2] += 3
+        mismatch = world_model_loss(model, corrupted_physics, project=command_projection, exogenous_from_state=extract)
+        self.assertGreater(float(mismatch["state"].detach()), 0.01)
+        # The target physical discrepancy remains visible in validation instead
+        # of being hidden by replacing the whole next state with real data.
+
+    def test_imagined_external_sampling_is_detached_and_keeps_actor_bptt(self):
+        policy, world = TinyActorCritic(), ExternalCommandWorld(gain=0.2)
+        with torch.no_grad():
+            policy.critic.weight.zero_()
+            policy.critic.bias.zero_()
+        batch, horizon = 3, 5
+        commands = [nn.Parameter(torch.randn(batch, 1)) for _ in range(horizon)]
+        seen_flags = []
+
+        def sample(previous):
+            seen_flags.append(previous.requires_grad)
+            # Returning existing leaf parameters ensures the learner itself
+            # detaches external values, not merely callback-created operations.
+            return {"command": commands[len(seen_flags) - 1]}
+
+        trajectory = imagine(
+            policy, world, torch.randn(batch, 6), command_observations,
+            horizon=horizon, project=command_projection, exogenous_sampler=sample,
+            reward_callback=lambda state, action, nxt, reward, step: -nxt[:, 2].square(),
+        )
+        trajectory["actor_loss"].backward()
+        self.assertEqual(seen_flags, [False] * horizon)
+        self.assertTrue(all(value.grad is None for value in commands))
+        self.assertTrue(all(p.grad is None for p in world.parameters()))
+        self.assertTrue(all(p.grad is None for p in policy.critic.parameters()))
+        self.assertGreater(sum(float(p.grad.abs().sum()) for p in policy.actor.parameters()), 1e-6)
+        for step, command in enumerate(commands):
+            torch.testing.assert_close(trajectory["states"][:, step + 1, 5:6], command.detach())
+
+    def test_omitting_external_callbacks_preserves_existing_behavior(self):
+        policy, world = TinyActorCritic(), CoupledOracle()
+        starts = torch.randn(3, 6)
+        implicit = imagine(policy, world, starts, observations, horizon=4)
+        explicit = imagine(policy, world, starts, observations, horizon=4, exogenous_sampler=None)
+        for name in ("objective", "states", "targets", "rewards"):
+            torch.testing.assert_close(implicit[name], explicit[name], rtol=0, atol=0)
+        batch = self.batch()
+        model = self.fitted_model(batch)
+        implicit_loss = world_model_loss(model, batch)
+        explicit_loss = world_model_loss(model, batch, exogenous_from_state=None)
+        for key in implicit_loss:
+            torch.testing.assert_close(implicit_loss[key], explicit_loss[key], rtol=0, atol=0)
 
 
 if __name__ == "__main__":

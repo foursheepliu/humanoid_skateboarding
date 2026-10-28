@@ -185,5 +185,75 @@
     "equal_quality_convergence_speedup_established": false,
     "physical_quality_evaluation_scope": "One fixed-seed, fixed-command 30-second play rollout per policy; not a success rate.",
     "memory_scope": "peak_torch_allocated_bytes excludes MuJoCo/Warp, CUDA context and driver allocations."
+  },
+  "conditional_commands_v2": {
+    "iterations": 50,
+    "stable_mean_seconds": 0.7174700769906243,
+    "gpu_tests_passed": 39,
+    "accepted_actor_steps": 50.0,
+    "teacher_policy_sha256": "528560e39ab45fe25c08fa4bac37c5795fe2fdd0054fb644f208e1e33d77275d",
+    "candidate_policy_sha256": "282196d8248d94a79e3155c11e4f446ceb7b8b461aff1ae19bde68e0dcbeb3dd",
+    "batch64_teacher": {
+      "num_envs": 64,
+      "num_ever_fell_over_70deg": 5,
+      "diagnostic_ever_fell_fraction": 0.078125,
+      "minimum_root_height_m": 0.06984290480613708,
+      "maximum_root_tilt_degrees": 174.88043212890625,
+      "total_resets": 0,
+      "nonfinite_envs": 0,
+      "pooled_pushing_velocity_mae_mps": 0.13531821711736722,
+      "pooled_steering_heading_mae_rad": 0.22157583003060316,
+      "pooled_steering_both_feet_board_fraction": 0.9964556709265175
+    },
+    "batch64_candidate": {
+      "num_envs": 64,
+      "num_ever_fell_over_70deg": 5,
+      "diagnostic_ever_fell_fraction": 0.078125,
+      "minimum_root_height_m": 0.07257895916700363,
+      "maximum_root_tilt_degrees": 171.69834899902344,
+      "total_resets": 0,
+      "nonfinite_envs": 0,
+      "pooled_pushing_velocity_mae_mps": 0.13285762312078297,
+      "pooled_steering_heading_mae_rad": 0.220714046307408,
+      "pooled_steering_both_feet_board_fraction": 0.9997004792332268
+    },
+    "identical_initial_conditions": true,
+    "identical_command_sequences": true,
+    "scope": "64 randomized play conditions, one seed, deterministic mean policy, failure terminations disabled. Root tilt is independent diagnostic, not a task success rate. Own-normalized training losses are not comparable between models.",
+    "fixed32_raw_audit": {
+      "audit32_legacy_reuse": {
+        "batch_sha256": "7a40a169bd3beda72e2a7548f07973deb776775633a9bfb57c6e91711eccd880",
+        "model_sha256": "9a4967bf380edc6480a965f293acc150401d75ef56dcfe67fbd78c21942ff5ab",
+        "raw_rmse": {
+          "policy": 0.048321957816757036,
+          "robot_root_position": 0.021733096477371098,
+          "robot_joint_velocity": 0.8673937261999093,
+          "skateboard_root_position": 0.02132665421194808
+        },
+        "reward_raw_mae": 0.018187491213893736
+      },
+      "audit32_conditional_oldmodel": {
+        "batch_sha256": "7a40a169bd3beda72e2a7548f07973deb776775633a9bfb57c6e91711eccd880",
+        "model_sha256": "9a4967bf380edc6480a965f293acc150401d75ef56dcfe67fbd78c21942ff5ab",
+        "raw_rmse": {
+          "policy": 0.04647335097565627,
+          "robot_root_position": 0.02170416117893905,
+          "robot_joint_velocity": 0.8673150822092338,
+          "skateboard_root_position": 0.021246639854532387
+        },
+        "reward_raw_mae": 0.01817175843439145
+      },
+      "audit32_conditional_newmodel": {
+        "batch_sha256": "7a40a169bd3beda72e2a7548f07973deb776775633a9bfb57c6e91711eccd880",
+        "model_sha256": "0aa2af5fc6e43c65f75440d62c865eb454698e1603d914caac01e938d1c48d80",
+        "raw_rmse": {
+          "policy": 0.061643282266603434,
+          "robot_root_position": 0.02338576151031527,
+          "robot_joint_velocity": 1.1057808840707293,
+          "skateboard_root_position": 0.019512517780807415
+        },
+        "reward_raw_mae": 0.019056345237459027
+      }
+    }
   }
 }
