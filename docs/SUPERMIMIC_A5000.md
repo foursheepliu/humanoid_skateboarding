@@ -322,6 +322,38 @@ counts. Paired trials forward this option only to PPO and reject reused reports
 whose effective rollout differs. Compare fresh profiles from a shared initial
 state and include a matched quality evaluation before claiming a speed gain.
 
+## Optional analytical board reward terms
+
+`--supermimic.analytic-board-rewards` computes the original board-speed and
+board-flat terms from predicted next physics. The remaining reward head learns
+`R - S_real`, with its own real-data normalization. The original total task
+reward `R` remains in replay and real AMP reward mixing; a separate scalar side
+label stores `S_real`. This option defaults to off and is currently mutually
+exclusive with the separate analytical action-cost ablation.
+
+A temporary instance observer reads the ten required board/phase coordinates
+immediately after the original regularization reward computation. It forwards
+the original computation and return unchanged, then restores the method. This
+captures every label before reset, command resampling or interval events,
+including physical failures and timeouts, without fabricating terminal
+observations. A native 20,000-transition check covered 40 physical terminals,
+15 natural timeouts and all five phases; term-cache and total-reward
+reconstruction errors were at most 3e-8.
+
+The model returns `residual + S_predicted` without another continuation factor.
+The residual fitting loss uses the observed `R - S_real` target independently
+of `S_predicted`; these losses are not equivalent to fitting total predicted
+reward against `R`. Actor gradients pass through the analytical terms, using
+the adapter's unit quaternion and reward-time phase clock with the old command.
+Model fitting retains all reward/failure labels and still masks unavailable
+post-reset dynamics targets. This decomposition does not remove Jensen or
+alive-conditional dynamics bias and has not established faster learning.
+
+Native checkpoints save the representation and live term/phase metadata.
+Loading across reward representations, including weights-only loading, is
+rejected before mutation. The disabled FP32 and BF16 paths were checked against
+the previous implementation with exact tensor, optimizer and RNG agreement.
+
 The source task and bundled RSL-RL retain their existing licenses. Reference
 links describe algorithm provenance; the new backend does not bundle LAFAN
 assets or pretrained checkpoints from the reference project.

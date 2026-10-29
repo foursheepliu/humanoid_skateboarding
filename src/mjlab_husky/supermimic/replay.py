@@ -6,15 +6,20 @@ from torch import Tensor
 
 class ReplayBuffer:
     def __init__(self, capacity: int, num_envs: int, state_dim: int,
-                 action_dim: int, device="cpu", seed=0):
+                 action_dim: int, device="cpu", seed=0, *, known_s_real: bool = False):
         if min(capacity, num_envs, state_dim, action_dim) < 1:
             raise ValueError("Replay dimensions must be positive")
         self.capacity, self.num_envs = capacity, num_envs
         self.state_dim, self.action_dim = state_dim, action_dim
         self.device, self.steps = str(device), 0
+        if type(known_s_real) is not bool:
+            raise ValueError("known_s_real replay storage flag must be a boolean")
+        self.known_s_real = known_s_real
         self.generator = torch.Generator(device=device).manual_seed(seed)
         shapes = {"state": (state_dim,), "next_state": (state_dim,), "action": (action_dim,),
                   "reward": (), "terminated": (), "truncated": (), "next_state_valid": ()}
+        if known_s_real:
+            shapes["known_s_real"] = ()
         self.data = {key: torch.empty((capacity, num_envs, *shape), device=device,
                                      dtype=torch.bool if key in ("terminated", "truncated", "next_state_valid")
                                      else torch.float32) for key, shape in shapes.items()}
@@ -25,10 +30,16 @@ class ReplayBuffer:
     @torch.no_grad()
     def append(self, state: Tensor, action: Tensor, next_state: Tensor, reward: Tensor,
                terminated: Tensor, truncated: Tensor,
-               next_state_valid: Tensor | None = None):
+               next_state_valid: Tensor | None = None, *, known_s_real: Tensor | None = None):
+        if self.known_s_real != (known_s_real is not None):
+            raise ValueError("Replay board-reward side label presence differs from its schema")
+        if known_s_real is not None and not known_s_real.is_floating_point():
+            raise ValueError("Known-S replay labels must be floating-point real rewards")
         values = {"state": state, "action": action, "next_state": next_state,
                   "reward": reward.reshape(-1), "terminated": terminated.bool().reshape(-1),
                   "truncated": truncated.bool().reshape(-1)}
+        if known_s_real is not None:
+            values["known_s_real"] = known_s_real.reshape(-1)
         values["next_state_valid"] = (~(values["terminated"] | values["truncated"])
                                      if next_state_valid is None else next_state_valid.bool().reshape(-1))
         slot = self.steps % self.capacity
@@ -81,6 +92,8 @@ class ReplayBuffer:
         for key, value in state["data"].items():
             if key not in self.data or value.shape != self.data[key][:retained].shape:
                 raise ValueError(f"Replay checkpoint shape differs for {key}")
+            if key == "known_s_real" and (not value.is_floating_point() or not torch.isfinite(value).all()):
+                raise ValueError("Replay checkpoint has invalid real known-S labels")
         if set(state["data"]) != set(self.data):
             raise ValueError("Replay checkpoint fields differ")
         for key, value in state["data"].items():

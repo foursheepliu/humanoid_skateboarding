@@ -14,6 +14,12 @@ class SuperMimicConfig:
     detach_critic_transition_targets: bool = True
     project_transition_memory: bool = False
     analytic_action_cost: bool = False
+    analytic_board_rewards: bool = False
+    """Two analytic next-physical terms plus independently supervised R-S head.
+
+    This preserves real rewards; nonlinear S of alive-conditional model states
+    does not guarantee an unbiased expected total reward prediction.
+    """
     real_steps: int = 5
     horizon: int = 32
     model_sequence_length: int = 8
@@ -54,6 +60,10 @@ class SuperMimicConfig:
             raise ValueError("project_transition_memory must be a boolean")
         if not isinstance(self.analytic_action_cost, bool):
             raise ValueError("analytic_action_cost must be a boolean")
+        if type(self.analytic_board_rewards) is not bool:
+            raise ValueError("analytic_board_rewards must be a boolean")
+        if self.analytic_action_cost and self.analytic_board_rewards:
+            raise ValueError("analytic_action_cost and analytic_board_rewards cannot be enabled together")
         if self.model_precision not in ("float32", "bfloat16"):
             raise ValueError("model_precision must be float32 or bfloat16")
         if self.critic_loss_profile not in ("legacy_survival_mean", "reference_time_sum"):
@@ -110,6 +120,7 @@ class SuperMimicConfig:
         values.setdefault("detach_critic_transition_targets", False)
         values.setdefault("project_transition_memory", False)
         values.setdefault("analytic_action_cost", False)
+        values.setdefault("analytic_board_rewards", False)
         values.setdefault("model_precision", "float32")
         values.setdefault("critic_loss_profile", "legacy_survival_mean")
         values.setdefault("actor_adam_beta2", 0.999)

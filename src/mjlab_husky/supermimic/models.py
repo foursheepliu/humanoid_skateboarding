@@ -83,7 +83,7 @@ def frozen_parameters(*modules):
 class WorldModel(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, hidden_dims=(512, 512, 512),
                  learning_rate=2e-4, device="cpu", gradient_clip=1.0,
-                 project_next=None, known_reward=None, precision="float32"):
+                 project_next=None, known_reward=None, precision="float32", known_board_reward=None):
         super().__init__()
         if state_dim < 1 or action_dim < 1 or not hidden_dims or min(hidden_dims) < 1:
             raise ValueError("Model dimensions must be positive")
@@ -110,6 +110,12 @@ class WorldModel(nn.Module):
         if known_reward is not None and (not callable(known_reward) or isinstance(known_reward, nn.Module)):
             raise ValueError("known_reward must be a parameter-free callable, not an nn.Module")
         self.known_reward = known_reward
+        if known_board_reward is not None and (
+                known_reward is not None or not callable(known_board_reward)
+                or isinstance(known_board_reward, nn.Module)
+                or not callable(getattr(known_board_reward, "metadata", None))):
+            raise ValueError("Known board reward must be a parameter-free callable with metadata, used without known action costs")
+        self.known_board_reward = known_board_reward
         # Training may condition known external command/noise updates on their
         # observed samples without teacher-forcing any physical prediction.
         self.project_training_next = None
@@ -138,8 +144,16 @@ class WorldModel(nn.Module):
 
     @torch.no_grad()
     def update_normalization(self, state: Tensor, action: Tensor, next_state: Tensor,
-                             reward: Tensor, next_state_valid: Tensor | None = None):
+                             reward: Tensor, next_state_valid: Tensor | None = None, *,
+                             known_s_real: Tensor | None = None):
         """Call once per newly collected transition, never for replay/imagination."""
+        if self.known_board_reward is not None:
+            if (known_s_real is None or known_s_real.shape != state.shape[:-1]
+                    or not known_s_real.is_floating_point()
+                    or not torch.isfinite(known_s_real).all()):
+                raise ValueError("Board residual normalization requires every finite real known-S side label")
+        elif known_s_real is not None:
+            raise ValueError("Known-S labels require the board-residual representation")
         if self.precision == "bfloat16":
             state, action, next_state, reward = (value.float() for value in
                                                  (state, action, next_state, reward))
@@ -149,6 +163,8 @@ class WorldModel(nn.Module):
             delta = delta[next_state_valid.bool()]
         self.delta_norm.update(delta)
         residual = reward
+        if self.known_board_reward is not None:
+            residual = reward.reshape(known_s_real.shape) - known_s_real
         if self.known_reward is not None:
             known = self.known_reward(state, action)
             if known.shape != state.shape[:-1]:
@@ -159,6 +175,14 @@ class WorldModel(nn.Module):
         self.reward_norm.update(residual.reshape(-1, 1))
 
     def forward(self, state: Tensor, action: Tensor) -> Prediction:
+        if self.known_board_reward is not None:
+            if self.precision == "bfloat16":
+                state, action = state.float(), action.float()
+            prediction = self._board_residual_prediction(state, action)
+            known = self.known_board_reward(state, prediction.next_state)
+            if known.shape != prediction.reward.shape:
+                raise ValueError("Known board reward dimensions differ from the predicted total reward")
+            return Prediction(prediction.next_state, prediction.reward + known, prediction.termination_logit)
         if self.precision == "bfloat16":
             return self._forward_bfloat16(state, action)
         # Retain the original FP32 operation order and checkpoint tensor schema.
@@ -175,6 +199,25 @@ class WorldModel(nn.Module):
         if known.shape != prediction.reward.shape:
             raise ValueError("Known reward dimensions differ from the total reward prediction")
         return Prediction(prediction.next_state, prediction.reward + known, prediction.termination_logit)
+
+    def _board_residual_prediction(self, state: Tensor, action: Tensor) -> Prediction:
+        """Raw next state, independent residual head and term logit; no S decode.
+
+        Sequence fitting supervises this residual directly against R-S_real.
+        It must not reconstruct the residual by subtracting S_pred from total R.
+        Terminal dynamics stay masked; nonlinear S of the predicted conditional
+        state can still have Jensen/terminal-conditioning bias in total reward.
+        """
+        if self.precision == "bfloat16":
+            # Known action costs are mutually exclusive, so this native BF16
+            # path returns the decoded residual without any analytical addend.
+            return self._forward_bfloat16(state, action)
+        features = self.input_norm(torch.cat((state, action), -1))
+        hidden = self.trunk(features)
+        return Prediction(
+            state + self.delta_norm.decode(self.delta_head(hidden)),
+            self.reward_norm.decode(self.reward_head(hidden)).squeeze(-1),
+            self.termination_head(hidden).squeeze(-1))
 
     def _forward_bfloat16(self, state: Tensor, action: Tensor) -> Prediction:
         # Only MLP execution is mixed precision. Normalization, analytical task
@@ -216,12 +259,19 @@ class WorldModel(nn.Module):
         state = batch["state"][:, 0].detach()
         valid = batch.get("valid", torch.ones_like(batch["reward"], dtype=torch.bool))[:, :steps]
         next_valid = batch.get("next_state_valid", ~(batch["terminated"] | batch["truncated"]))[:, :steps]
+        if self.known_board_reward is not None:
+            known_s_real = batch.get("known_s_real")
+            if (known_s_real is None or known_s_real.shape != batch["reward"].shape
+                    or not known_s_real.is_floating_point()
+                    or not torch.isfinite(known_s_real).all()):
+                raise ValueError("Board residual fitting requires real known-S labels for the entire sequence")
         state_sum = state.new_zeros(())
         reward_sum = state.new_zeros(())
         termination_sum = state.new_zeros(())
         for t in range(steps):
             action = batch["action"][:, t].detach()
-            prediction = self(state, action)
+            prediction = (self(state, action) if self.known_board_reward is None
+                          else self._board_residual_prediction(state, action))
             if self.project_training_next is not None:
                 next_state = self.project_training_next(
                     state, prediction.next_state, action, batch["next_state"][:, t].detach())
@@ -230,10 +280,13 @@ class WorldModel(nn.Module):
                               else self.project_next(state, prediction.next_state, action))
             state_error = ((next_state - batch["next_state"][:, t].detach())
                            / self.delta_norm.scale(state)).square().mean(-1)
-            # Replay retains R and forward returns total R, even when the
-            # normalizer/head represent R-A. Exact projected action histories
-            # make this the residual error, scaled by the residual std.
-            reward_error = ((prediction.reward - batch["reward"][:, t].detach())
+            # The action-only branch is algebraically a residual error. Board
+            # rewards instead use the raw head and observed R-S_real target;
+            # S_pred is deliberately absent from this loss.
+            reward_target = batch["reward"][:, t].detach()
+            if self.known_board_reward is not None:
+                reward_target = reward_target - known_s_real[:, t].detach()
+            reward_error = ((prediction.reward - reward_target)
                             / self.reward_norm.scale(prediction.reward)[0]).square()
             termination_error = F.binary_cross_entropy_with_logits(
                 prediction.termination_logit, batch["terminated"][:, t].float(), reduction="none")
@@ -270,6 +323,9 @@ class WorldModel(nn.Module):
                 "hidden_dims": self.hidden_dims}
         if self.known_reward is not None:
             state["reward_representation"] = "action_residual"
+        if self.known_board_reward is not None:
+            state["reward_representation"] = "board_residual_v1"
+            state["known_board_reward"] = self.known_board_reward.metadata()
         if self.precision != "float32":
             state["precision"] = self.precision
         return state
@@ -278,9 +334,12 @@ class WorldModel(nn.Module):
         if (state["state_dim"], state["action_dim"], tuple(state["hidden_dims"])) != (
                 self.state_dim, self.action_dim, self.hidden_dims):
             raise ValueError("World-model checkpoint architecture differs")
-        expected = "action_residual" if self.known_reward is not None else "total"
+        expected = ("board_residual_v1" if self.known_board_reward is not None else
+                    "action_residual" if self.known_reward is not None else "total")
         if state.get("reward_representation", "total") != expected:
             raise ValueError("World-model reward representation differs; scalar-total and residual heads cannot be interchanged")
+        if self.known_board_reward is not None and state.get("known_board_reward") != self.known_board_reward.metadata():
+            raise ValueError("World-model known board reward metadata differs")
         if state.get("precision", "float32") != self.precision:
             raise ValueError("World-model training precision differs; use matching precision for optimizer resume "
                              "or explicitly load only FP32 model weights without optimizer state")

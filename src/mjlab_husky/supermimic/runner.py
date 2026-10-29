@@ -77,7 +77,7 @@ class SuperMimicRunner:
     """
 
     def __init__(self, env, train_cfg: dict, log_dir: str | None = None,
-                 device="cpu", *, adapter=None, amp=None, known_reward=None):
+                 device="cpu", *, adapter=None, amp=None, known_reward=None, known_board_reward=None):
         self.env, self.cfg = env, train_cfg
         self.device = torch.device(device)
         if int(os.environ.get("WORLD_SIZE", "1")) > 1:
@@ -146,6 +146,17 @@ class SuperMimicRunner:
             if not callable(known_reward) or not callable(getattr(known_reward, "metadata", None)):
                 raise ValueError("Runner known_reward must be callable and expose checkpoint metadata()")
             self.known_action_reward = known_reward
+        if known_board_reward is not None and not self.settings.analytic_board_rewards:
+            raise ValueError("An injected known_board_reward requires analytic_board_rewards=True")
+        self.known_board_reward = None
+        if self.settings.analytic_board_rewards:
+            if known_board_reward is None:
+                from .known_board_rewards import KnownBoardRewards
+                known_board_reward = KnownBoardRewards.from_env(env, self.adapter.layout)
+            if (not callable(known_board_reward) or not callable(getattr(known_board_reward, "metadata", None))
+                    or not callable(getattr(known_board_reward, "observe_step", None))):
+                raise ValueError("Known board reward must expose callable, metadata and reward-time observe_step APIs")
+            self.known_board_reward = known_board_reward
         self._project_next = self.adapter.project_next
         if self.settings.compile_projection and self.device.type == "cuda":
             # Fuse the many small history/kinematics kernels, leaving the
@@ -157,14 +168,16 @@ class SuperMimicRunner:
             hidden_dims=self.settings.model_hidden_dims,
             learning_rate=self.settings.model_learning_rate, device=self.device,
             gradient_clip=self.settings.max_grad_norm, project_next=self._project_next,
-            known_reward=self.known_action_reward, precision=self.settings.model_precision)
+            known_reward=self.known_action_reward, precision=self.settings.model_precision,
+            known_board_reward=self.known_board_reward)
         if getattr(self.adapter, "supports_exogenous_projection", False):
             self.world_model.project_training_next = lambda previous, predicted, action, target: (
                 self._project_next(previous, predicted, action,
                                           exogenous={"next_state": target}))
         self.replay = ReplayBuffer(
             self.settings.replay_capacity_steps, self.num_envs, self.adapter.state_dim,
-            self.adapter.action_dim, self.device, seed=int(train_cfg.get("seed", 42)) + 1)
+            self.adapter.action_dim, self.device, seed=int(train_cfg.get("seed", 42)) + 1,
+            known_s_real=self.known_board_reward is not None)
         self._actor_parameters = list(self.policy.actor.parameters())
         for name in ("std", "log_std"):
             noise_parameter = getattr(self.policy, name, None)
@@ -298,6 +311,7 @@ class SuperMimicRunner:
         """Collect fresh physics transitions; only this method updates WM/actor stats."""
         self.policy.train()
         task_rewards, total_rewards, amp_histories = [], [], []
+        board_rewards, residual_rewards = [], []
         failures = timeouts = 0
         prediction_error = 0.0
         validation_samples = 0
@@ -306,7 +320,17 @@ class SuperMimicRunner:
             self.policy.update_normalization(self._obs)
             action, _ = self._action(self._obs)
             self._finite("real action", action)
-            next_obs, task_reward, dones, extras = self.env.step(action.to(self.env.device))
+            known_s_real = None
+            if self.known_board_reward is None:
+                next_obs, task_reward, dones, extras = self.env.step(action.to(self.env.device))
+            else:
+                observer = self.known_board_reward.observe_step(self.env)
+                with observer:
+                    next_obs, task_reward, dones, extras = self.env.step(action.to(self.env.device))
+                known_s_real = observer.finish().to(self.device).detach()
+                if known_s_real.shape != (self.num_envs,) or not known_s_real.is_floating_point():
+                    raise ValueError("Known board reward observer must return one scalar per real transition")
+                self._finite("real known board reward", known_s_real)
             next_obs = self._observations(next_obs)
             task_reward = task_reward.to(self.device).reshape(-1).clone()
             self._finite("real task reward", task_reward)
@@ -337,9 +361,19 @@ class SuperMimicRunner:
                                           - self.adapter.layout.get(next_state, key)[valid]).abs()
                         position_errors[label] = position_errors.get(label, 0.0) + float(
                             absolute_error.reshape(int(valid.sum()), -1).mean(-1).sum())
-            self.world_model.update_normalization(self._state, action, next_state, task_reward, valid)
-            self.replay.append(self._state, action, next_state, task_reward,
-                               terminated, truncated, next_state_valid=valid)
+            if known_s_real is None:
+                self.world_model.update_normalization(self._state, action, next_state, task_reward, valid)
+                self.replay.append(self._state, action, next_state, task_reward,
+                                   terminated, truncated, next_state_valid=valid)
+            else:
+                # The original R remains the real/replay/AMP reward. Only the
+                # scalar head/statistics use the reward-time side label R-S.
+                self.world_model.update_normalization(self._state, action, next_state, task_reward, valid,
+                                                      known_s_real=known_s_real)
+                self.replay.append(self._state, action, next_state, task_reward,
+                                   terminated, truncated, next_state_valid=valid, known_s_real=known_s_real)
+                board_rewards.append(known_s_real)
+                residual_rewards.append(task_reward - known_s_real)
             # Reward uses the original post-step history and push gate, before reset history clearing.
             gate = self.adapter.layout.get(next_state, "amp_gate")
             real_reward = self.amp.reward(task_reward, next_frames, gate, differentiable=False)
@@ -373,6 +407,9 @@ class SuperMimicRunner:
                 "real/completed_episodes": len(self.episode_rewards),
                 "validation/one_step_normalized_rmse": math.sqrt(prediction_error / max(1, validation_samples)),
                 "validation/one_step_samples": validation_samples,
+                **({"real/known_board_reward": float(torch.cat(board_rewards).mean()),
+                    "real/residual_reward": float(torch.cat(residual_rewards).mean())}
+                   if board_rewards else {}),
                 **{f"validation/{name}_position_mae_m": error / max(1, validation_samples)
                    for name, error in position_errors.items()}}
 
@@ -590,6 +627,8 @@ class SuperMimicRunner:
                    "git_status_repos": self.git_status_repos}
         if self.known_action_reward is not None:
             payload["known_action_reward"] = self.known_action_reward.metadata()
+        if self.known_board_reward is not None:
+            payload["known_board_reward"] = self.known_board_reward.metadata()
         if self.settings.checkpoint_replay:
             payload["replay"] = self.replay.state_dict()
         checkpoint = {"model_state_dict": self.policy.state_dict(),
@@ -632,9 +671,14 @@ class SuperMimicRunner:
                 raise ValueError("Cannot load a world model across analytic_action_cost reward representations, "
                                  "including with load_optimizer=False. Start fresh or explicitly initialize only "
                                  "policy weights without importing this world model or its normalizer.")
+            if saved_config.analytic_board_rewards != self.settings.analytic_board_rewards:
+                raise ValueError("Cannot load a world model across analytic_board_rewards reward representations, "
+                                 "including with load_optimizer=False. Initialize only policy weights explicitly.")
             if self.known_action_reward is not None and (
                     payload.get("known_action_reward") != self.known_action_reward.metadata()):
                 raise ValueError("Known-action reward metadata differs (weights, dt, scaling or action-history schema)")
+            if self.known_board_reward is not None and payload.get("known_board_reward") != self.known_board_reward.metadata():
+                raise ValueError("Known-board reward metadata differs (live weights, std, dt, phase or state fields)")
             if load_optimizer and saved_config.model_precision != self.settings.model_precision:
                 raise ValueError("Cannot resume world-model optimizer across model_precision modes. "
                                  "Use load_optimizer=False explicitly to initialize FP32 master weights "
@@ -671,9 +715,12 @@ class SuperMimicRunner:
             model = payload["world_model"]
             if model.get("precision", "float32") != saved_config.model_precision:
                 raise ValueError("World-model precision metadata differs from the saved configuration")
-            expected_reward = "action_residual" if self.settings.analytic_action_cost else "total"
+            expected_reward = ("board_residual_v1" if self.settings.analytic_board_rewards else
+                               "action_residual" if self.settings.analytic_action_cost else "total")
             if model.get("reward_representation", "total") != expected_reward:
                 raise ValueError("World-model reward representation metadata differs from the configured known reward")
+            if self.known_board_reward is not None and model.get("known_board_reward") != self.known_board_reward.metadata():
+                raise ValueError("World-model board reward metadata differs from its live configuration")
             if (model["state_dim"], model["action_dim"], tuple(model["hidden_dims"])) != (
                     self.adapter.state_dim, self.adapter.action_dim, tuple(self.settings.model_hidden_dims)):
                 raise ValueError("Checkpoint world-model architecture differs")
@@ -694,6 +741,11 @@ class SuperMimicRunner:
                         value.shape != self.replay.data[name][:retained].shape
                         for name, value in replay["data"].items()):
                     raise ValueError("Checkpoint replay tensor dimensions differ")
+                if self.known_board_reward is not None:
+                    side = replay["data"]["known_s_real"]
+                    if not side.is_floating_point():
+                        raise ValueError("Checkpoint real known-S labels must be floating point")
+                    self._finite("checkpoint real known board rewards", side)
         self.policy.load_state_dict(checkpoint["model_state_dict"])
         self.current_learning_iteration = int(checkpoint.get("iter", 0))
         if payload is not None:

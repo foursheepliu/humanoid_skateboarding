@@ -22,6 +22,9 @@ except (ModuleNotFoundError, ImportError) as exc:
 
 from mjlab_husky.supermimic.adapter import StateLayout, roll_history, differentiable_amp_reward
 from mjlab_husky.supermimic.known_rewards import KnownActionRewards
+from mjlab_husky.supermimic.known_board_rewards import (
+    KnownBoardRewards, NextPhysicalRewards, capture_real_reward_physics, unit_quaternion,
+)
 from mjlab_husky.supermimic.models import frozen_parameters
 
 
@@ -163,6 +166,85 @@ class ActionToyAdapter(ToyAdapter):
         return self.layout.pack(fields)
 
 
+class BoardToyEnvironment(ToyEnvironment):
+    """Original reward ordering, then destructive autoreset of board physics."""
+    def __init__(self, *, flat_weight=3., flat_std=math.sqrt(.05)):
+        super().__init__()
+        self.step_dt, self.cycle_time = .02, 6.
+        self.phase_length_buf = torch.zeros(4)
+        self.command = torch.tensor([[1., 0.]]).repeat(4, 1)
+        self.command_manager = SimpleNamespace(get_command=lambda _name: self.command)
+        self.contact_phase = torch.zeros(4, 4)
+        self.skateboard = SimpleNamespace(data=SimpleNamespace(
+            root_link_quat_w=torch.tensor([[1., 0., 0., 0.]]).repeat(4, 1),
+            root_link_lin_vel_w=torch.zeros(4, 3), joint_pos=torch.zeros(4, 1)))
+        self.physical = NextPhysicalRewards(3., flat_weight, .5, flat_std, .02, True, True,
+                                           6., (0., .4, .5, .95, 1.))
+        self.recorded_rewards, self.recorded_S = [], []
+        env = self
+        class Regularization:
+            def __init__(self):
+                self.calls = 0
+            def compute(self, dt):
+                self.calls += 1
+                self.flat = env.physical.components(env.command, capture_real_reward_physics(env))[1]
+                return self.flat
+        self.reg_reward_manager = Regularization()
+
+    def step(self, action):
+        self.steps += 1
+        self.x = .9 * self.x + .1 * action
+        self.episode_length_buf += 1
+        next_phase = self.physical.reward_phase(self.phase_length_buf, self.command)
+        self.phase_length_buf += 1
+        self.contact_phase[:, :2] = next_phase
+        self.skateboard.data.root_link_lin_vel_w = torch.cat((self.x[:, :1], torch.zeros(4, 2)), -1)
+        self.skateboard.data.joint_pos = self.x[:, 1:2].clone()
+        self.reset_terminated, self.reset_time_outs = torch.zeros(4, dtype=torch.bool), torch.zeros(4, dtype=torch.bool)
+        if self.steps % 3 == 0:
+            self.reset_time_outs[0] = True
+        if self.steps % 5 == 0:
+            self.reset_terminated[1] = True
+        push = self.physical.components(self.command, capture_real_reward_physics(self))[0]
+        flat = self.reg_reward_manager.compute(self.step_dt)
+        known = push + flat
+        reward = 1 - self.x.square().sum(-1) + known
+        self.recorded_rewards.append(reward.clone()); self.recorded_S.append(known.clone())
+        done = self.reset_terminated | self.reset_time_outs
+        self.x[done] = 0
+        self.episode_length_buf[done] = self.phase_length_buf[done] = 0
+        self.skateboard.data.root_link_lin_vel_w[done] = 0
+        self.skateboard.data.joint_pos[done] = 0
+        return self.get_observations(), reward, done, {"time_outs": self.reset_time_outs}
+
+
+class BoardToyAdapter(ToyAdapter):
+    def __init__(self, env):
+        super().__init__(); self.env = env
+        self.layout = StateLayout({"actor_obs": 2, "critic_obs": 3, "amp_history": (2, 2), "amp_gate": (),
+            "phase_length_buf": (), "command.skate.command_b": 2, "skateboard.root_link_quat_w": 4,
+            "skateboard.root_link_lin_vel_w": 3, "skateboard.joint_pos": 1, "contact_phase": 4})
+        self.state_dim = self.layout.dim
+
+    def capture(self, obs, frames):
+        return self.layout.pack(actor_obs=obs["policy"], critic_obs=obs["critic"], amp_history=frames,
+            amp_gate=torch.ones(len(frames)), phase_length_buf=self.env.phase_length_buf,
+            **{"command.skate.command_b": self.env.command,
+               "skateboard.root_link_quat_w": self.env.skateboard.data.root_link_quat_w,
+               "skateboard.root_link_lin_vel_w": self.env.skateboard.data.root_link_lin_vel_w,
+               "skateboard.joint_pos": self.env.skateboard.data.joint_pos, "contact_phase": self.env.contact_phase})
+
+    def project_next(self, state, predicted, action):
+        fields = self.layout.unpack(super().project_next(state, predicted, action))
+        previous = self.layout.unpack(state)
+        fields["phase_length_buf"] = previous["phase_length_buf"] + 1
+        fields["command.skate.command_b"] = previous["command.skate.command_b"]
+        fields["skateboard.root_link_quat_w"] = unit_quaternion(fields["skateboard.root_link_quat_w"])
+        phase = self.env.physical.reward_phase(previous["phase_length_buf"], previous["command.skate.command_b"])
+        fields["contact_phase"] = torch.cat((phase, torch.zeros_like(phase)), -1)
+        return self.layout.pack(fields)
+
+
 class ToyDiscriminator(nn.Linear):
     def __init__(self):
         super().__init__(4, 1)
@@ -234,6 +316,104 @@ class RunnerTests(unittest.TestCase):
         known = (KnownActionRewards(adapter.layout, weight, weight, step_dt, True)
                  if config["supermimic"].get("analytic_action_cost", False) else None)
         return SuperMimicRunner(env, config, adapter=adapter, amp=ToyAmp(), known_reward=known)
+
+    def make_board_runner(self, config=None, **physical):
+        config = config or self.config(analytic_board_rewards=True)
+        env = BoardToyEnvironment(**physical); adapter = BoardToyAdapter(env)
+        known = (KnownBoardRewards(adapter.layout, env.physical)
+                 if config["supermimic"].get("analytic_board_rewards", False) else None)
+        return SuperMimicRunner(env, config, adapter=adapter, amp=ToyAmp(), known_board_reward=known)
+
+    def test_board_collection_preserves_all_original_rewards_and_reward_time_side_labels(self):
+        runner = self.make_board_runner()
+        runner.collect(); runner.collect()
+        replay = runner.replay.data
+        R, S = torch.stack(runner.env.recorded_rewards), torch.stack(runner.env.recorded_S)
+        torch.testing.assert_close(replay["reward"][:10], R)
+        torch.testing.assert_close(replay["known_s_real"][:10], S)
+        torch.testing.assert_close(runner.world_model.reward_norm.mean, (R - S).double().mean()[None])
+        self.assertEqual(int(runner.world_model.reward_norm.count), 40)
+        self.assertEqual(runner.env.reg_reward_manager.calls, 10)
+        self.assertNotIn("compute", runner.env.reg_reward_manager.__dict__)
+        done = replay["terminated"][:10] | replay["truncated"][:10]
+        self.assertTrue(done.any() and replay["terminated"][:10].any() and replay["truncated"][:10].any())
+        reset_prediction = runner.known_board_reward(replay["state"][:10], replay["next_state"][:10])
+        self.assertGreater(float((reset_prediction[done] - S[done]).abs().max()), 1e-6)
+        self.assertEqual(int(runner.world_model.delta_norm.count), int((~done).sum()))
+        counts = [int(runner.world_model.reward_norm.count), int(runner.policy.actor_obs_normalizer.count)]
+        before = copy.deepcopy(runner.policy.actor.state_dict())
+        runner.fit_world_model(); runner.update_actor_critic()
+        self.assertTrue(any(not torch.equal(value, runner.policy.actor.state_dict()[key]) for key, value in before.items()))
+        self.assertEqual(counts, [int(runner.world_model.reward_norm.count), int(runner.policy.actor_obs_normalizer.count)])
+
+    def test_board_checkpoint_native_and_all_mode_metadata_guards_before_mutation(self):
+        config = self.config(analytic_board_rewards=True, checkpoint_replay=True)
+        def snapshot(runner):
+            return copy.deepcopy({"policy": runner.policy.state_dict(), "world": runner.world_model.state_dict(),
+                "actor_opt": runner.actor_optimizer.state_dict(), "critic_opt": runner.critic_optimizer.state_dict(),
+                "model_opt": runner.world_model.optimizer.state_dict(), "replay": runner.replay.state_dict()})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "board.pt"
+            runner = self.make_board_runner(config); runner.learn(1); runner.save(str(path))
+            payload = torch.load(path, weights_only=False)
+            self.assertEqual(payload["supermimic"]["world_model"]["reward_representation"], "board_residual_v1")
+            self.assertIn("known_s_real", payload["supermimic"]["replay"]["data"])
+            native = self.make_board_runner(config); native.load(str(path))
+            self.assert_tree_identical(runner.policy.state_dict(), native.policy.state_dict())
+            self.assert_tree_identical(runner.world_model.state_dict(), native.world_model.state_dict())
+            for load_optimizer in (True, False):
+                for changed in (self.make_board_runner(self.config(checkpoint_replay=True)),
+                                self.make_board_runner(config, flat_weight=4.),
+                                self.make_board_runner(config, flat_std=.3)):
+                    before = snapshot(changed)
+                    with self.assertRaises(ValueError):
+                        changed.load(str(path), load_optimizer=load_optimizer)
+                    self.assert_tree_identical(before, snapshot(changed))
+                for label in ("metadata", "representation", "side_label"):
+                    corrupt = copy.deepcopy(payload)
+                    if label == "metadata":
+                        corrupt["supermimic"]["world_model"]["known_board_reward"]["step_dt"] = 99.
+                    elif label == "representation":
+                        corrupt["supermimic"]["world_model"]["reward_representation"] = "total"
+                    else:
+                        corrupt["supermimic"]["replay"]["data"].pop("known_s_real")
+                    bad_path = Path(directory) / (label + ".pt"); torch.save(corrupt, bad_path)
+                    changed = self.make_board_runner(config); before = snapshot(changed)
+                    with self.assertRaises(ValueError):
+                        changed.load(str(bad_path), load_optimizer=load_optimizer)
+                    self.assert_tree_identical(before, snapshot(changed))
+            plain = self.make_board_runner(self.config(checkpoint_replay=True))
+            plain.learn(1); plain.save(str(path))
+            legacy = torch.load(path, weights_only=False)
+            legacy["supermimic"]["config"].pop("analytic_board_rewards")
+            torch.save(legacy, path)
+            restored = self.make_board_runner(self.config(checkpoint_replay=True)); restored.load(str(path))
+            self.assert_tree_identical(plain.world_model.state_dict(), restored.world_model.state_dict())
+
+    def test_board_flag_is_strict_and_mutually_exclusive_with_action_cost(self):
+        for value in (1, None, "true"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.make_board_runner(self.config(analytic_board_rewards=value))
+        with self.assertRaises(ValueError):
+            self.make_board_runner(self.config(analytic_board_rewards=True, analytic_action_cost=True))
+
+    def test_board_bfloat16_h32_keeps_total_reward_FP32_stats_and_native_resume(self):
+        config = self.config(analytic_board_rewards=True, model_precision="bfloat16", checkpoint_replay=True,
+                             critic_loss_profile="reference_time_sum", actor_adam_beta2=.95, actor_element_clip=.1)
+        runner = self.make_board_runner(config); runner.learn(1)
+        self.assertEqual(int(runner.world_model.reward_norm.count), 20)
+        before = copy.deepcopy(runner.world_model.state_dict())
+        with torch.no_grad():
+            action, _ = runner._action(runner._obs, imagination=True)
+            prediction = runner.world_model(runner._state, action)
+        self.assertEqual(prediction.reward.dtype, torch.float32)
+        self.assertTrue(all(p.dtype == torch.float32 for p in runner.world_model.parameters()))
+        self.assert_tree_identical(before, runner.world_model.state_dict())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bf_board.pt"; runner.save(str(path))
+            restored = self.make_board_runner(config); restored.load(str(path))
+            self.assert_tree_identical(runner.world_model.state_dict(), restored.world_model.state_dict())
+            self.assert_tree_identical(runner.actor_optimizer.state_dict(), restored.actor_optimizer.state_dict())
 
     def assert_tree_identical(self, left, right):
         if isinstance(left, torch.Tensor):

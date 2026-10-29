@@ -10,7 +10,39 @@ from mjlab_husky.supermimic.models import WorldModel, frozen_parameters
 from mjlab_husky.supermimic.replay import ReplayBuffer
 
 
+class _KnownBoard:
+    def __init__(self, scale=2.):
+        self.scale, self.calls = scale, 0
+
+    def __call__(self, state, raw_next):
+        self.calls += 1
+        return self.scale * raw_next[..., 0]
+
+    def metadata(self):
+        return {"test": "minimal next physical", "scale": self.scale}
+
+
 class ReplayTests(unittest.TestCase):
+    def test_board_side_label_preserves_original_R_and_all_boundary_labels(self):
+        replay = ReplayBuffer(4, 3, 2, 1, known_s_real=True)
+        state, action = torch.zeros(3, 2), torch.zeros(3, 1)
+        reward, known = torch.tensor([3., 5., 7.]), torch.tensor([.1, .2, .3])
+        term, timeout = torch.tensor([False, True, False]), torch.tensor([False, False, True])
+        with self.assertRaises(ValueError):
+            replay.append(state, action, state, reward, term, timeout)
+        self.assertEqual(replay.steps, 0)
+        replay.append(state, action, state, reward, term, timeout, known_s_real=known)
+        torch.testing.assert_close(replay.data["reward"][0], reward)
+        torch.testing.assert_close(replay.data["known_s_real"][0], known)
+        restored = ReplayBuffer(4, 3, 2, 1, known_s_real=True)
+        restored.load_state_dict(replay.state_dict())
+        sampled = restored.sample_sequences(64, 2)
+        self.assertTrue(sampled["valid"][:, 0].all())
+        torch.testing.assert_close(sampled["reward"][:, 0] - sampled["known_s_real"][:, 0],
+                                   (reward - known)[sampled["reward"][:, 0].long().sub(3).div(2, rounding_mode="floor")])
+        with self.assertRaises(ValueError):
+            ReplayBuffer(4, 3, 2, 1).load_state_dict(replay.state_dict())
+
     def test_windows_respect_both_reset_types_and_ring_overwrite(self):
         replay = ReplayBuffer(4, 2, 1, 1, seed=1)
         for t in range(8):
@@ -51,6 +83,75 @@ class ReplayTests(unittest.TestCase):
 
 
 class WorldTests(unittest.TestCase):
+    def test_board_residual_normalization_and_fit_keep_all_R_minus_realS_labels(self):
+        for precision in ("float32", "bfloat16"):
+            with self.subTest(precision=precision):
+                known = _KnownBoard()
+                model = WorldModel(2, 1, hidden_dims=(8,), known_board_reward=known, precision=precision)
+                state, action = torch.tensor([[1., 2.], [2., 3.], [3., 4.]]), torch.zeros(3, 1)
+                valid = torch.tensor([True, False, False])
+                next_state = torch.where(valid[:, None], state + 1, torch.full_like(state, 1e6))
+                real_s = torch.tensor([20., 30., 40.])
+                original_R = real_s + 5.
+                with self.assertRaises(ValueError):
+                    model.update_normalization(state, action, next_state, original_R, valid)
+                self.assertEqual(int(model.input_norm.count), 0)
+                model.update_normalization(state, action, next_state, original_R, valid, known_s_real=real_s)
+                self.assertEqual(int(model.delta_norm.count), 1)
+                self.assertEqual(int(model.reward_norm.count), 3)
+                torch.testing.assert_close(model.reward_norm.mean, torch.tensor([5.], dtype=torch.float64))
+                with torch.no_grad():
+                    model.reward_head.weight.zero_(); model.reward_head.bias.zero_()
+                batch = {"state": state[:, None], "action": action[:, None], "next_state": next_state[:, None],
+                         "reward": original_R[:, None], "known_s_real": real_s[:, None],
+                         "terminated": torch.tensor([[False], [True], [False]]),
+                         "truncated": torch.tensor([[False], [False], [True]]),
+                         "next_state_valid": valid[:, None], "valid": torch.ones(3, 1, dtype=torch.bool)}
+                known.calls = 0
+                losses = model.sequence_loss(batch)
+                self.assertEqual(known.calls, 0)  # No S_pred coupling/cancellation in head supervision.
+                self.assertEqual(float(losses["reward_loss"].detach()), 0.)
+                losses["reward_loss"].backward()
+                self.assertIsNone(model.delta_head.weight.grad)
+                prediction = model(state.double(), action.double()) if precision == "bfloat16" else model(state, action)
+                self.assertEqual(prediction.reward.dtype, torch.float32)
+                torch.testing.assert_close(prediction.reward, 5. + 2. * (state[:, 0] + 1))
+                self.assertFalse(torch.allclose(prediction.reward, original_R))
+                changed = {**batch, "reward": batch["reward"].clone()}
+                changed["reward"][1:] += .01
+                self.assertAlmostEqual(float(model.sequence_loss(changed)["reward_loss"].detach()), 2 / 3, places=3)
+
+    def test_board_forward_h32_keeps_physical_actor_gradient_and_metadata_guards(self):
+        known = _KnownBoard(.02)
+        model = WorldModel(2, 1, hidden_dims=(8,), known_board_reward=known)
+        with torch.no_grad():
+            model.reward_head.weight.zero_(); model.reward_head.bias.zero_()
+            model.delta_head.weight.normal_(0., .01)
+        actor = torch.nn.Linear(2, 1)
+        initial = copy.deepcopy(model.state_dict())
+        state, objective = torch.randn(4, 2) * .1, 0
+        with frozen_parameters(model):
+            for _ in range(32):
+                prediction = model(state, actor(state))
+                objective += prediction.reward.mean()
+                state = prediction.next_state
+            objective.backward()
+        self.assertGreater(sum(float(p.grad.abs().sum()) for p in actor.parameters()), 0.)
+        self.assertTrue(all(p.grad is None for p in model.parameters()))
+        for key, value in initial.items():
+            self.assertTrue(torch.equal(value, model.state_dict()[key]))
+        saved = copy.deepcopy(model.training_state_dict())
+        self.assertEqual(saved["reward_representation"], "board_residual_v1")
+        restored = WorldModel(2, 1, hidden_dims=(8,), known_board_reward=_KnownBoard(.02))
+        restored.load_training_state_dict(saved)
+        for changed in (WorldModel(2, 1, hidden_dims=(8,)),
+                        WorldModel(2, 1, hidden_dims=(8,), known_board_reward=_KnownBoard(.03))):
+            before = copy.deepcopy(changed.state_dict())
+            with self.assertRaises(ValueError):
+                changed.load_training_state_dict(saved)
+            for key, value in before.items():
+                self.assertTrue(torch.equal(value, changed.state_dict()[key]))
+
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(2)
